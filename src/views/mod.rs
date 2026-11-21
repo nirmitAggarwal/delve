@@ -1,0 +1,256 @@
+//! The five browsing views. Every view consumes the same tab state, selection
+//! model and context menus.
+
+pub mod detail;
+pub mod graph;
+pub mod icon;
+pub mod recursive;
+pub mod treemap;
+
+use crate::app::App;
+use crate::fs::Entry;
+use crate::settings::ViewKind;
+use gtk4 as gtk;
+use gtk4::glib;
+use gtk4::prelude::*;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+
+pub struct Views {
+    pub stack: gtk::Stack,
+    pub icon: icon::IconView,
+    pub detail: detail::DetailView,
+    pub recursive: recursive::RecursiveView,
+    pub treemap: treemap::TreemapView,
+    pub graph: graph::GraphView,
+}
+
+impl Views {
+    pub fn new(app: &Rc<App>, tab_id: u64) -> Views {
+        let icon = icon::IconView::new(app, tab_id);
+        let detail = detail::DetailView::new(app, tab_id);
+        let recursive = recursive::RecursiveView::new(app, tab_id);
+        let treemap = treemap::TreemapView::new(app, tab_id);
+        let graph = graph::GraphView::new(app, tab_id);
+        let stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .transition_duration(130)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        stack.add_named(&icon.overlay, Some("icon"));
+        stack.add_named(&detail.scroller, Some("detail"));
+        stack.add_named(&recursive.root, Some("recursive"));
+        stack.add_named(&treemap.root, Some("treemap"));
+        stack.add_named(&graph.root, Some("graph"));
+        icon.install_drop(app, tab_id);
+        Views { stack, icon, detail, recursive, treemap, graph }
+    }
+
+    pub fn show(&self, kind: ViewKind) {
+        let name = match kind {
+            ViewKind::Icon => "icon",
+            ViewKind::Detail => "detail",
+            ViewKind::Recursive => "recursive",
+            ViewKind::Treemap => "treemap",
+            ViewKind::Graph => "graph",
+        };
+        self.stack.set_visible_child_name(name);
+    }
+
+    pub fn current(&self) -> ViewKind {
+        match self.stack.visible_child_name().as_deref() {
+            Some("detail") => ViewKind::Detail,
+            Some("recursive") => ViewKind::Recursive,
+            Some("treemap") => ViewKind::Treemap,
+            Some("graph") => ViewKind::Graph,
+            _ => ViewKind::Icon,
+        }
+    }
+}
+
+/// Build a themed, theme-aware icon for an entry. Folder colours are applied as
+/// a tint class so they remain legible in every view and theme.
+pub fn folder_icon_name(entry: &Entry) -> &'static str {
+    let lower = entry.name.to_lowercase();
+    if entry.path == crate::paths::home() || lower == "home" || lower == "~" {
+        return "user-home";
+    }
+    if entry.path == crate::paths::user_dir(crate::paths::UserDir::Desktop) || lower.contains("desktop") {
+        return "user-desktop";
+    }
+    if lower.contains("document") {
+        return "folder-documents";
+    }
+    if lower.contains("download") {
+        return "folder-download";
+    }
+    if lower.contains("picture") || lower.contains("image") {
+        return "folder-pictures";
+    }
+    if lower.contains("music") || lower.contains("audio") {
+        return "folder-music";
+    }
+    if lower.contains("video") || lower.contains("movie") {
+        return "folder-videos";
+    }
+    if lower.contains("public") {
+        return "folder-publicshare";
+    }
+    if lower.contains("template") {
+        return "folder-templates";
+    }
+    "folder"
+}
+
+pub fn entry_icon(app: &App, entry: &Entry, pixel_size: i32) -> gtk::Image {
+    let image = if entry.is_dir {
+        if app.meta.borrow().folder_color(&entry.path).is_some() {
+            // Custom folder colours are applied as a tint over the symbolic
+            // icon so they work with every icon theme.
+            gtk::Image::from_icon_name("folder-symbolic")
+        } else {
+            gtk::Image::from_icon_name(folder_icon_name(entry))
+        }
+    } else {
+        let mime = entry.mime();
+        let named = match mime.as_str() {
+            "application/zip" | "application/x-zip-compressed" | "application/x-compressed-tar"
+            | "application/gzip" | "application/x-tar" | "application/x-7z-compressed"
+            | "application/x-rar" | "application/x-rar-compressed" => Some("package-x-generic"),
+            "application/pdf" => Some("application-pdf"),
+            "image/svg+xml" => Some("image-x-generic"),
+            _ => None,
+        };
+        if let Some(name) = named {
+            gtk::Image::from_icon_name(name)
+        } else {
+            let icon = gtk::gio::content_type_get_icon(&mime);
+            gtk::Image::from_gicon(&icon)
+        }
+    };
+    image.set_pixel_size(pixel_size);
+    image.add_css_class("entry-icon");
+    if entry.is_dir {
+        if let Some(color) = app.meta.borrow().folder_color(&entry.path) {
+            image.add_css_class(&format!("tintfg-{}", crate::theme::color_class(&color)));
+            image.set_tooltip_text(Some(&format!("Folder colour {}", color)));
+        }
+        if entry.broken_link {
+            image.set_opacity(0.5);
+        }
+    }
+    image
+}
+
+pub fn tag_summary(app: &App, path: &Path) -> String {
+    let meta = app.meta.borrow();
+    let names = meta.tag_names_for(path);
+    names.join(", ")
+}
+
+/// Queue asynchronous thumbnail generation for icon cells.
+pub fn queue_icons(app: &Rc<App>, entries: &[Entry], size: i32) {
+    if !app.settings.borrow().thumbnails {
+        return;
+    }
+    let jobs: Vec<(PathBuf, Entry)> = entries
+        .iter()
+        .filter(|e| e.is_image() || e.is_video() || e.is_pdf())
+        .take(800)
+        .map(|e| (e.path.clone(), e.clone()))
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    app.queue_thumbnails(jobs, size.max(32) as u32);
+}
+
+/// Accept file drops on a row. A folder row is the destination; dropping on a
+/// file row targets the tab's current folder.
+pub fn install_row_drop<W: IsA<gtk::Widget>>(widget: &W, app: &Rc<App>, tab_id: u64) {
+    let row = widget.clone();
+    let target = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE,
+    );
+    let row_enter = row.clone();
+    target.connect_enter(move |_, _, _| {
+        row_enter.add_css_class("drop-hover");
+        gtk::gdk::DragAction::MOVE
+    });
+    let row_leave = row.clone();
+    target.connect_leave(move |_| row_leave.remove_css_class("drop-hover"));
+    let strong = Rc::downgrade(app);
+    let row_drop = row.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(files) = value.get::<gtk::gdk::FileList>() else { return false };
+        let paths: Vec<PathBuf> = files.files().iter().filter_map(|f| f.path()).collect();
+        if paths.is_empty() {
+            return false;
+        }
+        let Some(app) = strong.upgrade() else { return false };
+        let hovered = row_drop.tooltip_text().map(PathBuf::from);
+        let dest = hovered
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                app.tab_by_id(tab_id)
+                    .and_then(|tab| tab.state.borrow().location.path().cloned())
+            });
+        let Some(dest) = dest else { return false };
+        app.drop_paths_to(dest, paths);
+        true
+    });
+    widget.add_controller(target);
+}
+
+pub fn clear_children(container: &impl IsA<gtk::Widget>) {
+    let mut child = container.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        if let Some(parent) = c.parent() {
+            if let Some(boxed) = parent.downcast_ref::<gtk::FlowBox>() {
+                boxed.remove(&c);
+            } else if let Some(listbox) = parent.downcast_ref::<gtk::ListBox>() {
+                listbox.remove(&c);
+            } else if let Some(b) = parent.downcast_ref::<gtk::Box>() {
+                b.remove(&c);
+            }
+        }
+        child = next;
+    }
+}
+
+/// Convert a selection of entries to paths for the tab model.
+pub fn paths(entries: &[Entry]) -> Vec<PathBuf> {
+    entries.iter().map(|e| e.path.clone()).collect()
+}
+
+pub fn format_size(app: &App, bytes: u64) -> String {
+    if app.settings.borrow().byte_sizes {
+        format!("{} B", bytes)
+    } else {
+        crate::fs::human_size(bytes)
+    }
+}
+
+pub fn weak(widget: &impl IsA<gtk::Widget>) -> glib::WeakRef<gtk::Widget> {
+    let obj: gtk::Widget = widget.clone().upcast();
+    obj.downgrade()
+}
+
+pub type ImageMap = Rc<std::cell::RefCell<HashMap<PathBuf, glib::WeakRef<gtk::Image>>>>;
+
+pub fn downgrade_app(app: &Rc<App>) -> Weak<App> {
+    Rc::downgrade(app)
+}
+
+/// Visit the set bits of a selection bitset. GTK4's Bitset exposes no iterator.
+pub fn bitset_indices(bitset: &gtk::Bitset) -> Vec<u32> {
+    if bitset.is_empty() {
+        return Vec::new();
+    }
+    let max = bitset.maximum();
+    (0..=max).filter(|i| bitset.contains(*i)).collect()
+}
