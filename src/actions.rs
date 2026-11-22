@@ -1047,104 +1047,23 @@ impl App {
         self.meta
             .borrow_mut()
             .set_folder_color(path, color.clone());
-        let colors = self.meta.borrow().items.values().filter_map(|i| i.folder_color.clone()).collect::<Vec<_>>();
+        let mut colors = self
+            .meta
+            .borrow()
+            .items
+            .values()
+            .filter_map(|i| i.folder_color.clone())
+            .collect::<Vec<_>>();
+        colors.extend(self.meta.borrow().tags.iter().map(|t| t.color.clone()));
         let settings = self.settings.borrow().clone();
         self.theme.apply_folder_colors(&colors, &settings);
         self.refresh_after_metadata_change();
     }
 
-    pub fn show_folder_color_menu(self: &Rc<Self>, anchor: &impl IsA<gtk::Widget>, paths: Vec<PathBuf>) {
-        let popover = gtk::Popover::new();
-        popover.set_has_arrow(false);
-        popover.set_parent(anchor);
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        let title = gtk::Label::new(Some("Folder colour"));
-        title.add_css_class("section-title");
-        title.set_margin_start(8);
-        title.set_xalign(0.0);
-        list.append(&title);
-        for (name, color) in crate::theme::FOLDER_PALETTE {
-            let row = gtk::Button::new();
-            row.add_css_class("flat");
-            let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            dot.add_css_class("color-dot");
-            dot.add_css_class(&format!("swatch-{}", crate::theme::color_class(color)));
-            dot.set_size_request(12, 12);
-            b.append(&dot);
-            let label = gtk::Label::new(Some(name));
-            label.set_xalign(0.0);
-            b.append(&label);
-            row.set_child(Some(&b));
-            let weak = Rc::downgrade(self);
-            let paths = paths.clone();
-            let popover_ref = popover.clone();
-            let color_value = color.to_string();
-            row.connect_clicked(move |_| {
-                if let Some(app) = weak.upgrade() {
-                    for path in &paths {
-                        app.set_folder_color(path, Some(color_value.clone()));
-                    }
-                    popover_ref.popdown();
-                }
-            });
-            list.append(&row);
-        }
-        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        {
-            let row = gtk::Button::with_label("Custom colour…");
-            row.add_css_class("flat");
-            let weak = Rc::downgrade(self);
-            let paths = paths.clone();
-            let popover_ref = popover.clone();
-            row.connect_clicked(move |_| {
-                popover_ref.popdown();
-                let Some(app) = weak.upgrade() else { return };
-                let dialog = gtk::ColorDialog::new();
-                dialog.set_with_alpha(false);
-                dialog.set_title("Choose a folder colour");
-                let weak = Rc::downgrade(&app);
-                let paths = paths.clone();
-                dialog.choose_rgba(
-                    Some(&app.window),
-                    None,
-                    None::<&gio::Cancellable>,
-                    move |result| {
-                        if let Ok(color) = result {
-                            if let Some(app) = weak.upgrade() {
-                                let hex = crate::util::color_to_hex(
-                                    (color.red() * 255.0) as u8,
-                                    (color.green() * 255.0) as u8,
-                                    (color.blue() * 255.0) as u8,
-                                );
-                                for path in &paths {
-                                    app.set_folder_color(path, Some(hex.clone()));
-                                }
-                            }
-                        }
-                    },
-                );
-            });
-            list.append(&row);
-        }
-        {
-            let row = gtk::Button::with_label("Clear colour");
-            row.add_css_class("flat");
-            let weak = Rc::downgrade(self);
-            let paths = paths.clone();
-            let popover_ref = popover.clone();
-            row.connect_clicked(move |_| {
-                if let Some(app) = weak.upgrade() {
-                    for path in &paths {
-                        app.set_folder_color(path, None);
-                    }
-                    popover_ref.popdown();
-                }
-            });
-            list.append(&row);
-        }
-        popover.set_child(Some(&list));
-        popover.popup();
+    pub fn show_folder_color_menu(self: &Rc<Self>, _anchor: &impl IsA<gtk::Widget>, paths: Vec<PathBuf>) {
+        // A dialog avoids parenting a popover to an item inside a context menu
+        // that has already been dismissed.
+        crate::dialogs::folder_color_dialog(self, paths);
     }
 
     // -----------------------------------------------------------------
@@ -1263,6 +1182,11 @@ impl App {
                 }
             })),
             ("terminal", Box::new(|a| a.open_terminal())),
+            ("runs", Box::new(|a| {
+                let runner = &a.ui().runner;
+                runner.reveal(!runner.root.reveals_child());
+            })),
+            ("spotlight", Box::new(|a| crate::spotlight::open(a))),
             ("organise", Box::new(|a| {
                 if let Some(tab) = a.active_tab() {
                     crate::dialogs::organise_dialog(a, tab.id);
@@ -1322,6 +1246,11 @@ impl App {
             if id == "redo" && !accels.contains(&"<Control>y") {
                 accels.push("<Control>y");
             }
+            // Some desktops reserve Super+Space for their own launcher. Keep a
+            // secondary accelerator so Spotlight remains reachable.
+            if id == "spotlight" && !accels.contains(&"<Control>space") {
+                accels.push("<Control>space");
+            }
             self.gtk_app
                 .set_accels_for_action(&format!("win.{id}"), &accels);
         }
@@ -1330,6 +1259,45 @@ impl App {
     // -----------------------------------------------------------------
     // Terminal and commands
     // -----------------------------------------------------------------
+
+    /// Run a command set assigned to a Shift+S slot. Slot 0 is the picker.
+    pub fn run_command_slot(self: &Rc<Self>, slot: u8) {
+        let Some(folder) = self.active_location().path().cloned() else {
+            self.notify("Open a folder before running command sets.", true);
+            return;
+        };
+        if slot == 0 {
+            crate::dialogs::run_commands_picker(self, folder, self.selected_paths());
+            return;
+        }
+        let assigned = self
+            .settings
+            .borrow()
+            .commands
+            .iter()
+            .find(|command| command.shortcut == slot)
+            .cloned();
+        let Some(profile) = assigned else {
+            self.notify(
+                &format!("No command set is assigned to Shift+S, {slot}."),
+                true,
+            );
+            return;
+        };
+        if !profile.enabled {
+            self.notify(&format!("“{}” is disabled.", profile.name), true);
+            return;
+        }
+        if !profile.applies_to(&folder) {
+            self.notify(
+                &format!("“{}” is not available in this folder.", profile.name),
+                true,
+            );
+            return;
+        }
+        let selected = self.selected_paths();
+        crate::runner::start(self, profile, folder, selected);
+    }
 
     pub fn open_terminal(self: &Rc<Self>) {
         let Some(tab) = self.active_tab() else { return };
@@ -1375,10 +1343,7 @@ impl App {
     pub fn fill_sort_popover(self: &Rc<Self>, popover: &gtk::Popover) {
         let Some(tab) = self.active_tab() else { return };
         let tab_id = tab.id;
-        let (sort, columns) = {
-            let state = tab.state.borrow();
-            (state.sort, self.settings.borrow().detail_columns.clone())
-        };
+        let sort = tab.state.borrow().sort;
         let list = gtk::Box::new(gtk::Orientation::Vertical, 1);
         list.add_css_class("sort-menu-content");
         list.set_width_request(206);
@@ -1435,11 +1400,19 @@ impl App {
             });
         }
         list.append(&folders);
-        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let col_title = gtk::Label::new(Some("DETAIL COLUMNS"));
-        col_title.add_css_class("section-title");
-        col_title.set_xalign(0.0);
-        list.append(&col_title);
+        popover.set_child(Some(&list));
+    }
+
+    /// Detail-column visibility lives in the preview pane, not the sort menu.
+    pub fn fill_columns_popover(self: &Rc<Self>, popover: &gtk::Popover) {
+        let columns = self.settings.borrow().detail_columns.clone();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        list.add_css_class("sort-menu-content");
+        list.set_width_request(190);
+        let title = gtk::Label::new(Some("DETAIL COLUMNS"));
+        title.add_css_class("section-title");
+        title.set_xalign(0.0);
+        list.append(&title);
         for (key, label) in [
             ("type", "Type"),
             ("size", "Size"),
@@ -1529,6 +1502,14 @@ impl App {
             }
         }));
         item("Open in terminal", Some("Ctrl+Shift+E"), Box::new(|a| a.open_terminal()));
+        item("Run command sets…", Some("Shift+S, 0"), Box::new(|a| {
+            if let Some(folder) = a.active_location().path().cloned() {
+                crate::dialogs::run_commands_picker(a, folder, a.selected_paths());
+            } else {
+                a.notify("Open a folder before running command sets.", true);
+            }
+        }));
+        item("Manage command sets…", None, Box::new(|a| a.open_settings(Some("commands"))));
         list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         item("New tab", Some("Ctrl+T"), Box::new(|a| {
             let loc = a.active_location();
@@ -1795,12 +1776,6 @@ impl App {
                     crate::dialogs::open_with_dialog(a, &entry);
                 }));
             }
-            let first = selected[0].clone();
-            add("Open containing folder", None, true, Box::new(move |a| {
-                if let Some(parent) = first.path.parent() {
-                    a.navigate_active(Location::Path(parent.to_path_buf()));
-                }
-            }));
             if selected.iter().all(|e| e.is_dir) {
                 let dirs: Vec<Entry> = selected.clone();
                 add("Open in new tab", None, true, Box::new(move |a| {
@@ -1811,7 +1786,6 @@ impl App {
             }
             separator();
             add("Duplicate", Some("Ctrl+D"), true, Box::new(|a| a.duplicate_selection()));
-            add("Create symbolic link", None, true, Box::new(|a| a.create_links()));
             separator();
             let paths_del = paths.clone();
             add("Delete permanently…", Some("Shift+Delete"), true, Box::new(move |a| {
@@ -1828,12 +1802,6 @@ impl App {
                 a.copy_text(&paths_copy.iter().map(|p| fs::file_name_of(p)).collect::<Vec<_>>().join("\n"));
                 a.notify("Filename copied", false);
             }));
-            let paths_copy = paths.clone();
-            add("Copy as URI", None, true, Box::new(move |a| {
-                a.copy_text(&paths_copy.iter().map(|p| fs::uri_for(p)).collect::<Vec<_>>().join("\n"));
-                a.notify("URI copied", false);
-            }));
-
             // Tags live in their own window so the menu stays short.
             separator();
             let tag_paths = paths.clone();
@@ -1920,55 +1888,44 @@ impl App {
                     .borrow()
                     .commands
                     .iter()
-                    .filter(|c| c.enabled)
-                    .filter(|c| match &c.folder {
-                        Some(f) => f == &dir,
-                        None => true,
-                    })
+                    .filter(|c| c.enabled && c.applies_to(&dir))
                     .cloned()
                     .collect();
-                if !commands.is_empty() {
-                    separator();
-                    let cmd_title = gtk::Label::new(Some("RUN COMMAND"));
-                    cmd_title.add_css_class("section-title");
-                    cmd_title.set_margin_start(8);
-                    cmd_title.set_xalign(0.0);
-                    list.append(&cmd_title);
-                    for cmd in commands {
-                        let entry = cmd.clone();
-                        let selected_paths = paths.clone();
-                        add(&cmd.name, None, true, Box::new(move |a| {
-                            let entry = entry.clone();
-                            let selected_paths = selected_paths.clone();
-                            crate::dialogs::confirm(
-                                a,
-                                &format!("Run “{}”?", entry.name),
-                                &format!(
-                                    "This will execute:\n{} {}",
-                                    entry.program,
-                                    entry.args.join(" ")
-                                ),
-                                "Run",
-                                false,
-                                move |app| {
-                                    let folder = app
-                                        .active_location()
-                                        .path()
-                                        .cloned()
-                                        .unwrap_or_else(crate::paths::home);
-                                    match crate::terminal::launch_run_command(
-                                        &entry,
-                                        &folder,
-                                        &selected_paths,
-                                    ) {
-                                        Ok(()) => app.notify("Command started", false),
-                                        Err(err) => app.notify(&err, true),
-                                    }
-                                },
-                            );
-                        }));
-                    }
+                separator();
+                let cmd_title = gtk::Label::new(Some("RUN COMMAND SETS"));
+                cmd_title.add_css_class("section-title");
+                cmd_title.set_margin_start(8);
+                cmd_title.set_xalign(0.0);
+                list.append(&cmd_title);
+                let picker_dir = dir.clone();
+                let picker_paths = paths.clone();
+                add("Run multiple sets…", Some("Shift+S, 0"), true, Box::new(move |a| {
+                    crate::dialogs::run_commands_picker(
+                        a,
+                        picker_dir.clone(),
+                        picker_paths.clone(),
+                    );
+                }));
+                for cmd in commands {
+                    let entry = cmd.clone();
+                    let selected_paths = paths.clone();
+                    let profile_dir = dir.clone();
+                    let hint = cmd.shortcut_label();
+                    add(&cmd.name, hint.as_deref(), true, Box::new(move |a| {
+                        crate::runner::confirm_and_start(
+                            a,
+                            entry.clone(),
+                            profile_dir.clone(),
+                            selected_paths.clone(),
+                        );
+                    }));
                 }
+                add("New command set…", None, true, Box::new(move |a| {
+                    crate::dialogs::run_command_editor(a, None);
+                }));
+                add("Manage command sets…", None, true, Box::new(move |a| {
+                    a.open_settings(Some("commands"));
+                }));
             }
         } else {
             add("New folder", None, true, Box::new(|a| a.create_folder_or_file(true)));
@@ -1989,6 +1946,46 @@ impl App {
                 }
             }));
             add("Open in terminal", None, true, Box::new(|a| a.open_terminal()));
+            if let Some(dir) = current_dir.clone() {
+                let commands: Vec<crate::settings::RunCommand> = self
+                    .settings
+                    .borrow()
+                    .commands
+                    .iter()
+                    .filter(|c| c.enabled && c.applies_to(&dir))
+                    .cloned()
+                    .collect();
+                separator();
+                let title = gtk::Label::new(Some("RUN COMMAND SETS"));
+                title.add_css_class("section-title");
+                title.set_margin_start(8);
+                title.set_xalign(0.0);
+                list.append(&title);
+                let picker_dir = dir.clone();
+                add("Run multiple sets…", Some("Shift+S, 0"), true, Box::new(move |a| {
+                    crate::dialogs::run_commands_picker(a, picker_dir.clone(), Vec::new());
+                }));
+                for cmd in commands {
+                    let entry = cmd.clone();
+                    let profile_dir = dir.clone();
+                    let hint = cmd.shortcut_label();
+                    add(&cmd.name, hint.as_deref(), true, Box::new(move |a| {
+                        crate::runner::confirm_and_start(
+                            a,
+                            entry.clone(),
+                            profile_dir.clone(),
+                            Vec::new(),
+                        );
+                    }));
+                }
+                add("New command set…", None, true, Box::new(move |a| {
+                    crate::dialogs::run_command_editor(a, None);
+                }));
+                add("Manage command sets…", None, true, Box::new(move |a| {
+                    a.open_settings(Some("commands"));
+                }));
+            }
+            separator();
             add("Properties", None, true, Box::new(|a| {
                 if let Some(dir) = a.active_location().path() {
                     crate::dialogs::properties_dialog(a, vec![Entry::from_path(dir.clone(), fs::file_name_of(dir))]);
@@ -2011,14 +2008,11 @@ fn context_icon(label: &str) -> Option<&'static str> {
     match base {
         "Open" | "Open all" => Some("document-open-symbolic"),
         "Open with…" => Some("application-x-executable-symbolic"),
-        "Open containing folder" => Some("folder-open-symbolic"),
         "Open in new tab" => Some("tab-new-symbolic"),
         "Duplicate" => Some("edit-copy-symbolic"),
-        "Create symbolic link" => Some("insert-link-symbolic"),
         "Delete permanently…" => Some("edit-delete-symbolic"),
         "Copy path" => Some("edit-copy-symbolic"),
         "Copy filename" => Some("edit-copy-symbolic"),
-        "Copy as URI" => Some("edit-copy-symbolic"),
         "Assign tags…" | "Manage tags…" => Some("tag-symbolic"),
         "Compress…" => Some("package-x-generic-symbolic"),
         "Extract here" | "Extract to…" => Some("package-x-generic-symbolic"),
@@ -2031,9 +2025,11 @@ fn context_icon(label: &str) -> Option<&'static str> {
         "Refresh" => Some("view-refresh-symbolic"),
         "Toggle hidden files" => Some("view-reveal-symbolic"),
         "Organise folder…" => Some("view-sort-descending-symbolic"),
+        "Run multiple sets…" => Some("system-run-symbolic"),
+        "New command set…" => Some("list-add-symbolic"),
+        "Manage command sets…" => Some("emblem-system-symbolic"),
         "Restore" => Some("edit-undo-symbolic"),
         "Empty Trash…" => Some("user-trash-symbolic"),
-        "Manage tags…" => Some("tag-symbolic"),
         _ => None,
     }
 }

@@ -44,12 +44,12 @@ impl Inspector {
     }
 
     pub fn update(&self, app: &Rc<App>, tab_id: u64) {
-        let (selection, location) = {
+        let (selection, location, view) = {
             let tabs = app.tabs.borrow();
             let Some(tab) = tabs.iter().find(|t| t.id == tab_id) else { return };
             let state = tab.state.borrow();
             let selected = state.selected_entries();
-            (selected, state.location.clone())
+            (selected, state.location.clone(), state.view)
         };
         self.current.replace(selection.first().map(|e| e.path.clone()));
         self.frame.replace(None);
@@ -58,6 +58,11 @@ impl Inspector {
             let next = c.next_sibling();
             self.body.remove(&c);
             child = next;
+        }
+
+        // Detail-column controls belong to the preview pane, not the sort menu.
+        if view == crate::settings::ViewKind::Detail {
+            self.detail_columns_button(app);
         }
 
         if selection.is_empty() {
@@ -72,6 +77,25 @@ impl Inspector {
 
         let entry = &selection[0];
         self.single_state(app, tab_id, entry, &location);
+    }
+
+    fn detail_columns_button(&self, app: &Rc<App>) {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.set_halign(gtk::Align::Start);
+        let button = gtk::MenuButton::new();
+        button.set_label("Detail columns");
+        button.add_css_class("pill-button");
+        button.set_tooltip_text(Some("Choose which columns the detail view shows"));
+        let popover = gtk::Popover::new();
+        button.set_popover(Some(&popover));
+        let weak = Rc::downgrade(app);
+        popover.connect_show(move |p| {
+            if let Some(app) = weak.upgrade() {
+                app.fill_columns_popover(p);
+            }
+        });
+        row.append(&button);
+        self.body.append(&row);
     }
 
     fn empty_state(&self, location: &Location) {
@@ -292,16 +316,19 @@ impl Inspector {
         chips.set_halign(gtk::Align::Start);
         let assigned = app.meta.borrow().tags_for(&entry.path);
         for tag_id in &assigned {
-            let (name, color) = {
+            let (name, color, icon) = {
                 let meta = app.meta.borrow();
                 match meta.tag(tag_id) {
-                    Some(t) => (t.name.clone(), t.color.clone()),
+                    Some(t) => (t.name.clone(), t.color.clone(), t.icon.clone()),
                     None => continue,
                 }
             };
             let chip = gtk::Box::new(gtk::Orientation::Horizontal, 3);
             chip.add_css_class("chip");
             chip.add_css_class(&format!("tagchip-{}", crate::theme::color_class(&color)));
+            let tag_icon = gtk::Image::from_icon_name(&icon);
+            tag_icon.set_pixel_size(12);
+            chip.append(&tag_icon);
             let label = gtk::Label::new(Some(&name));
             chip.append(&label);
             let remove = gtk::Button::from_icon_name("window-close-symbolic");

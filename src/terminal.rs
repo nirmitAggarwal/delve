@@ -147,28 +147,18 @@ pub fn build_command(settings: &crate::settings::Settings, dir: &Path) -> Result
     Ok(cmd)
 }
 
-pub fn launch_terminal(settings: &crate::settings::Settings, dir: &Path) -> Result<(), String> {
-    let mut cmd = build_command(settings, dir)?;
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Could not launch the terminal: {e}"))
-}
-
-/// Launch a user-configured folder command. Arguments are passed as an argv
-/// vector; placeholders never go through a shell.
-pub fn launch_run_command(
-    command: &crate::settings::RunCommand,
+/// Expand a profile step into a direct argv command. No shell is involved.
+pub fn step_command(
+    profile: &crate::settings::RunCommand,
+    step: &crate::settings::RunStep,
     folder: &Path,
     selected: &[PathBuf],
-) -> Result<(), String> {
-    let program = crate::thumbnails::which(&command.program)
-        .ok_or_else(|| format!("“{}” was not found on this system.", command.program))?;
+) -> Result<Command, String> {
+    let program = crate::thumbnails::which(&step.program)
+        .ok_or_else(|| format!("“{}” was not found on this system.", step.program))?;
     let mut cmd = Command::new(program);
     let folder_str = folder.to_string_lossy().to_string();
-    for arg in &command.args {
+    for arg in &step.args {
         match arg.as_str() {
             "{selected}" | "{files}" => {
                 for path in selected {
@@ -185,7 +175,10 @@ pub fn launch_run_command(
             }
         }
     }
-    let cwd = match command.cwd_rule {
+    for (key, value) in &profile.env {
+        cmd.env(key, value);
+    }
+    let cwd = match profile.cwd_rule {
         crate::settings::CwdRule::Folder => folder.to_path_buf(),
         crate::settings::CwdRule::Home => crate::paths::home(),
         crate::settings::CwdRule::Selected => selected
@@ -197,10 +190,64 @@ pub fn launch_run_command(
     if cwd.is_dir() {
         cmd.current_dir(cwd);
     }
+    Ok(cmd)
+}
+
+/// Run one step of a profile inside a new terminal window. Terminal-specific
+/// exec flags are chosen from the detected emulator; a custom terminal uses
+/// `-e`, the most widely supported form.
+pub fn launch_program_in_terminal(
+    settings: &crate::settings::Settings,
+    dir: &Path,
+    program: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut cmd = build_command(settings, dir)?;
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let terminal = if settings.terminal.trim().is_empty() {
+        detect_terminals()
+            .into_iter()
+            .next()
+            .map(|t| t.program)
+            .unwrap_or_default()
+    } else {
+        split_args(settings.terminal.trim())
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    };
+    let base = Path::new(&terminal)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| terminal.clone());
+    match base.as_str() {
+        "kitty" | "xterm" | "urxvt" | "st" | "xdg-terminal-exec" => {}
+        "wezterm" | "gnome-terminal" | "ptyxis" => {
+            cmd.arg("--");
+        }
+        _ => {
+            cmd.arg("-e");
+        }
+    };
+    cmd.arg(program);
+    cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     cmd.spawn()
         .map(|_| ())
-        .map_err(|e| format!("Could not run “{}”: {e}", command.name))
+        .map_err(|e| format!("Could not launch the terminal: {e}"))
+}
+
+pub fn launch_terminal(settings: &crate::settings::Settings, dir: &Path) -> Result<(), String> {
+    let mut cmd = build_command(settings, dir)?;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not launch the terminal: {e}"))
 }

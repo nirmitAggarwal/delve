@@ -104,8 +104,38 @@ pub fn folder_icon_name(entry: &Entry) -> &'static str {
     "folder"
 }
 
+/// Return the configured custom icon source for an entry, if any. Folder rules
+/// match the folder colour, while file rules match MIME type or extension.
+pub fn custom_icon_source(app: &App, entry: &Entry) -> Option<String> {
+    let settings = app.settings.borrow();
+    if entry.is_dir {
+        let color = app.meta.borrow().folder_color(&entry.path);
+        settings
+            .custom_folder_icon(color.as_deref())
+            .map(str::to_string)
+    } else {
+        let mime = entry.mime();
+        settings
+            .custom_file_icon(&mime, &entry.name)
+            .map(str::to_string)
+    }
+}
+
+/// True when a custom icon replaces the normal icon (and therefore should also
+/// suppress thumbnail generation).
+pub fn has_custom_icon(app: &App, entry: &Entry) -> bool {
+    custom_icon_source(app, entry)
+        .is_some_and(|source| crate::theme::custom_icon_image(&source, 16).is_some())
+}
+
 pub fn entry_icon(app: &App, entry: &Entry, pixel_size: i32) -> gtk::Image {
-    let image = if entry.is_dir {
+    let custom = custom_icon_source(app, entry);
+    let custom_image = custom
+        .as_deref()
+        .and_then(|source| crate::theme::custom_icon_image(source, pixel_size));
+    let image = if let Some(image) = custom_image {
+        image
+    } else if entry.is_dir {
         if app.meta.borrow().folder_color(&entry.path).is_some() {
             // Custom folder colours are applied as a tint over the symbolic
             // icon so they work with every icon theme.
@@ -157,6 +187,7 @@ pub fn queue_icons(app: &Rc<App>, entries: &[Entry], size: i32) {
     }
     let jobs: Vec<(PathBuf, Entry)> = entries
         .iter()
+        .filter(|e| !has_custom_icon(app, e))
         .filter(|e| e.is_image() || e.is_video() || e.is_pdf())
         .take(800)
         .map(|e| (e.path.clone(), e.clone()))

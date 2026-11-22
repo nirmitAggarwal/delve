@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Delve
+GenericName=File Manager
+Comment=Browse, organise, and manage files on Linux
+Exec=delve %f
+TryExec=delve
+Icon=io.github.delve.FileManager
+Terminal=false
+StartupNotify=true
+StartupWMClass=io.github.delve.FileManager
+Categories=Utility;FileManager;
+MimeType=inode/directory;
+Keywords=files;folders;manager;browser;file manager;directory;

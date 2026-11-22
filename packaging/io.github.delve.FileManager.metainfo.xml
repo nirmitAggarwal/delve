@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.delve.FileManager</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Delve</name>
+  <summary>A fast, adaptable file manager for Linux</summary>
+  <developer id="io.github.delve">
+    <name>Delve contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      Delve is a distribution-neutral GTK4 file manager built for everyday file
+      work. It combines five folder views, independent tabs, real file
+      operations, archive support, tags, previews, and reusable command sets in
+      one native Linux application.
+    </p>
+    <p>Highlights:</p>
+    <ul>
+      <li>Icon, detail, recursive, treemap, and graph views with shared selection.</li>
+      <li>Copy, move, rename, duplicate, trash, restore, links, and conflict handling.</li>
+      <li>ZIP, TAR, and TAR.GZ creation and safe extraction.</li>
+      <li>Tags, folder colours, image thumbnails, and text previews.</li>
+      <li>Folder command sets with quick slots, parallel runs, and detached output.</li>
+      <li>Editable shortcuts, built-in themes, custom themes, and bundled icons.</li>
+      <li>Optional LocalSend file transfers.</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.delve.FileManager.desktop</launchable>
+  <provides>
+    <binary>delve</binary>
+  </provides>
+  <categories>
+    <category>Utility</category>
+    <category>FileManager</category>
+  </categories>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="1.0.0" date="2026-11-22">
+      <description>
+        <p>First stable release.</p>
+        <ul>
+          <li>Five synchronised folder views and independent tabs.</li>
+          <li>Complete file operations, archive creation, and safe extraction.</li>
+          <li>Tags, folder colours, previews, and inspector.</li>
+          <li>Command sets with parallel batches, quick slots, and detached output.</li>
+          <li>Bundled icon theme and offline application icons.</li>
+          <li>Complete user, install, build, release, and support documentation.</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -462,6 +462,11 @@ progressbar progress { background-color: @accent; border-radius: 999px; min-heig
   background: transparent;
 }
 .icon-cell:hover { background-color: @hover_bg; }
+.icon-preview {
+  background-color: alpha(@floating_bg, 0.55);
+  border: 1px solid @border_subtle;
+  border-radius: 8px;
+}
 .icon-cell.selected { background-color: @sel_bg; border-color: @sel_border; }
 .icon-cell.selected.multi { background-color: @sel_multi; }
 /* GTK paints selected flow-box children with the system accent; keep the
@@ -519,6 +524,40 @@ listview > row:hover { background-color: @hover_bg; }
   background-color: @accent_muted; border: 1px solid @border_selected; color: @text_primary;
 }
 .color-dot { border-radius: 999px; min-width: 10px; min-height: 10px; }
+
+/* ---------- Run command panel ---------- */
+.runner-panel {
+  background-color: @panel_bg;
+  border-top: 1px solid @border_subtle;
+}
+.runner-title { font-weight: 600; font-size: 9pt; }
+.runner-session { border-top: 1px solid @border_subtle; }
+.runner-session:first-child { border-top: none; }
+.runner-command { font-size: 9pt; }
+.runner-dot { font-size: 8pt; }
+.runner-output-scroll { background-color: @canvas_bg; border-radius: 6px; margin: 2px 0 2px 0; }
+.runner-output { font-family: monospace; font-size: 8.5pt; color: @text_secondary; padding: 6px; }
+.runner-expander { font-size: 8.5pt; }
+
+/* ---------- Quick Spotlight ---------- */
+.spotlight-window { background: transparent; }
+.spotlight {
+  background-color: @floating_bg;
+  border: 1px solid @border_strong;
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  margin: 6px;
+}
+.spotlight-entry { font-size: 12pt; padding: 8px 10px; }
+.spotlight-row { border-radius: 7px; margin: 0 8px; padding: 1px 0; }
+.spotlight-row:hover { background-color: @hover_bg; }
+.spotlight-row.selected { background-color: @accent_muted; border: none; }
+.spotlight-footer { padding: 6px 14px; border-top: 1px solid @border_subtle; }
+
+/* Tag hover discovery: a compact card that floats above the sidebar. */
+.tag-hover-card { padding: 3px 5px; }
+.tag-popover-title { font-weight: 600; font-size: 9.5pt; }
+.tag-icon { -gtk-icon-style: symbolic; }
 
 /* ---------- status bar ---------- */
 .status-text { font-size: 8.5pt; color: @text_secondary; }
@@ -656,6 +695,7 @@ popover > contents modelbutton, popover > contents button.flat {
 }
 .sort-pill:hover { background-color: @hover_bg; border-color: @border_strong; }
 .sort-pill-label { font-size: 8.5pt; font-weight: 600; }
+.sort-order { min-width: 26px; padding: 1px 6px; }
 
 /* compact sort menu */
 .sort-menu-content { padding: 6px; }
@@ -862,13 +902,25 @@ impl ThemeManager {
                 crate::util::css_string(&settings.mono_font)
             ));
         }
+        // Background opacity is applied only to surfaces. Text, icons, selection
+        // fills and hover states keep the theme's full-strength colours.
+        let mut alpha = settings.window_opacity.clamp(0.35, 1.0);
         if settings.transparency {
-            css.push_str(
-                ".delve-sidebar { background-color: alpha(@sidebar_bg, 0.90); }\n\
-                 .delve-inspector { background-color: alpha(@inspector_bg, 0.90); }\n\
-                 .delve-toolbar, .delve-statusbar, .delve-tabbar { background-color: alpha(@toolbar_bg, 0.90); }\n",
-            );
+            alpha = alpha.min(0.90);
         }
+        css.push_str(&format!(
+            "window.delve, .delve-root {{ background-color: alpha(@window_bg, {alpha:.3}); }}\n\
+             .delve-shell {{ background-color: transparent; }}\n\
+             .delve-sidebar {{ background-color: alpha(@sidebar_bg, {alpha:.3}); }}\n\
+             .delve-sidebar-scroller {{ background-color: transparent; }}\n\
+             .delve-inspector, .inspector-root {{ background-color: alpha(@inspector_bg, {alpha:.3}); }}\n\
+             .delve-canvas {{ background-color: alpha(@canvas_bg, {alpha:.3}); }}\n\
+             .delve-toolbar, .delve-navbar, .delve-commandbar, .delve-statusbar {{ background-color: alpha(@toolbar_bg, {alpha:.3}); }}\n\
+             .delve-tabbar {{ background-color: alpha(@tab_bg, {alpha:.3}); }}\n\
+             .delve-tabbar-scrolled {{ background-color: transparent; }}\n\
+             .delve-tab {{ background-color: alpha(@tab_bg, {alpha:.3}); }}\n\
+             .delve-tab.active {{ background-color: alpha(@tab_active_bg, {alpha:.3}); }}\n"
+        ));
         let _ = self.try_load(&self.overrides, &css);
     }
 
@@ -877,7 +929,14 @@ impl ThemeManager {
     pub fn apply_folder_colors(&self, colors: &[String], _settings: &Settings) {
         let mut css = String::new();
         let mut seen: Vec<String> = Vec::new();
-        for color in colors {
+        // Always define the built-in folder and tag palettes so swatches work
+        // even in a fresh profile with no coloured folders yet.
+        let mut all: Vec<String> = FOLDER_PALETTE.iter().map(|(_, c)| (*c).to_string()).collect();
+        all.extend([
+            "#5b9dff", "#43c98a", "#f2b134", "#e2679b", "#a78bfa", "#38bdf8",
+        ].iter().map(|c| (*c).to_string()));
+        all.extend(colors.iter().cloned());
+        for color in &all {
             let Some(hex) = sanitize_color(color) else { continue };
             if seen.contains(&hex) {
                 continue;
@@ -891,6 +950,7 @@ impl ThemeManager {
                  .tagchip-{class} {{ background-color: rgba({r},{g},{b},0.22); color: {text}; border: 1px solid rgba({r},{g},{b},0.55); }}\n\
                  .tintbg-{class} {{ background-color: rgba({r},{g},{b},0.18); }}\n\
                  .tintfg-{class} {{ color: {hex}; }}\n\
+                 .entry-icon.tintfg-{class}, .tag-icon.tintfg-{class} {{ color: {hex}; }}\n\
                  .swatch-{class} {{ background-color: {hex}; border: 1px solid rgba(0,0,0,0.25); }}\n"
             ));
         }
@@ -924,8 +984,86 @@ fn sanitize_color(value: &str) -> Option<String> {
     }
 }
 
+/// Canonical colour representation used for icon-rule keys and CSS classes.
+pub fn normalize_color(value: &str) -> Option<String> {
+    sanitize_color(value)
+}
+
+/// Copy an uploaded icon into Delve's data directory and return a stable
+/// `file:` source. Only image formats GTK can render are accepted.
+pub fn import_icon_file(source: &std::path::Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(source)
+        .map_err(|err| format!("Could not read that icon: {err}"))?;
+    if !metadata.is_file() {
+        return Err("Choose an image file.".into());
+    }
+    if metadata.len() > 8 * 1024 * 1024 {
+        return Err("Icon files must be smaller than 8 MB.".into());
+    }
+    let extension = source
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif") {
+        return Err("Use a PNG, JPEG, WebP or GIF icon.".into());
+    }
+    let dir = crate::paths::icons_dir();
+    std::fs::create_dir_all(&dir).map_err(|err| format!("Could not create the icons folder: {err}"))?;
+    let destination = dir.join(format!("custom-{}.{extension}", crate::util::now_millis()));
+    std::fs::copy(source, &destination)
+        .map_err(|err| format!("Could not save that icon: {err}"))?;
+    Ok(format!("file:{}", destination.display()))
+}
+
+/// Short human-readable label for an icon source.
+pub fn icon_source_label(source: &str) -> String {
+    if let Some(path) = source.strip_prefix("file:") {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| source.to_string())
+    } else {
+        source.to_string()
+    }
+}
+
+/// Build an icon widget from a stored source. Missing files or unknown themed
+/// icons return `None`, letting callers use the normal fallback icon.
+pub fn custom_icon_image(source: &str, pixel_size: i32) -> Option<gtk::Image> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+    let file_path = source
+        .strip_prefix("file:")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let path = std::path::PathBuf::from(source);
+            path.is_file().then_some(path)
+        });
+    if let Some(path) = file_path {
+        if !path.is_file() {
+            return None;
+        }
+        let image = gtk::Image::from_file(&path);
+        image.set_pixel_size(pixel_size);
+        return Some(image);
+    }
+    if let Some(display) = gdk::Display::default() {
+        if !gtk::IconTheme::for_display(&display).has_icon(source) {
+            return None;
+        }
+    }
+    let image = gtk::Image::from_icon_name(source);
+    image.set_pixel_size(pixel_size);
+    Some(image)
+}
+
 pub fn color_class(color: &str) -> String {
-    format!("c{}", crate::util::hash_key(&[color]))
+    // The stylesheet always hashes the normalised colour, so class lookups
+    // must normalise too ("#3EA09A" and "#3ea09a" are the same colour).
+    let normalized = sanitize_color(color).unwrap_or_else(|| color.trim().to_ascii_lowercase());
+    format!("c{}", crate::util::hash_key(&[normalized.as_str()]))
 }
 
 /// Known palette offered in folder-colour menus.
@@ -942,9 +1080,22 @@ pub const FOLDER_PALETTE: &[(&str, &str)] = &[
     ("Slate", "#7f8c9b"),
 ];
 
+/// The complete icon theme embedded in the Delve binary. Keeping this as the
+/// default means the UI never depends on a desktop icon theme being installed.
+pub const BUNDLED_ICON_THEME: &str = "Delve";
+
+/// Register the embedded icon theme with the current display. This must run
+/// after GTK has initialised and before the first themed widget is built.
+pub fn init_bundled_icons() {
+    if let Some(display) = gdk::Display::default() {
+        gtk::IconTheme::for_display(&display)
+            .add_resource_path("/io/github/delve/FileManager/icons");
+    }
+}
+
 /// Detect installed icon themes without assuming any particular one.
 pub fn detect_icon_themes() -> Vec<String> {
-    let mut names = Vec::new();
+    let mut names = vec![BUNDLED_ICON_THEME.to_string()];
     let mut roots = vec![
         crate::paths::home().join(".local/share/icons"),
         crate::paths::home().join(".icons"),
@@ -987,14 +1138,10 @@ pub fn apply_icon_theme(name: &str) {
     }
 }
 
-/// Best-effort system default when the user has not chosen one.
+/// The bundled theme is always available, so it is the safe default. Users can
+/// still select any installed icon theme from Settings.
 fn fallback_icon_theme() -> Option<String> {
-    for candidate in ["Colloid-Dark", "Colloid", "Adwaita", "hicolor"] {
-        if crate::theme::detect_icon_themes().iter().any(|n| n == candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    None
+    Some(BUNDLED_ICON_THEME.to_string())
 }
 
 /// Write a documented, editable copy of a built-in theme and return its id.

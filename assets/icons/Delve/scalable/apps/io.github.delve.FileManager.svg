@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Delve</title>
+  <desc id="desc">A layered teal folder with a white D cutout.</desc>
+  <defs>
+    <linearGradient id="bg" x1="64" y1="32" x2="456" y2="488" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#15272a"/>
+      <stop offset="0.52" stop-color="#0c191c"/>
+      <stop offset="1" stop-color="#070d10"/>
+    </linearGradient>
+    <linearGradient id="back" x1="112" y1="154" x2="364" y2="410" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0e766e"/>
+      <stop offset="1" stop-color="#0a4e4c"/>
+    </linearGradient>
+    <linearGradient id="front" x1="112" y1="212" x2="400" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset="0.54" stop-color="#22c7b8"/>
+      <stop offset="1" stop-color="#0f9b91"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="108" y1="206" x2="394" y2="438" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ccfbf1"/>
+      <stop offset="1" stop-color="#99f6e4" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(378 116) rotate(132) scale(212)">
+      <stop offset="0" stop-color="#2dd4bf" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="70" y="120" width="380" height="350" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="18" stdDeviation="16" flood-color="#000000" flood-opacity=".45"/>
+    </filter>
+  </defs>
+
+  <rect x="12" y="12" width="488" height="488" rx="112" fill="url(#bg)"/>
+  <rect x="12.5" y="12.5" width="487" height="487" rx="111.5" fill="none" stroke="#5eead4" stroke-opacity=".16"/>
+  <circle cx="380" cy="112" r="212" fill="url(#glow)"/>
+
+  <!-- Three receding sheets suggest browsing deeper into a folder. -->
+  <g opacity=".32">
+    <path d="M174 124h99l58 54H232z" fill="#5eead4"/>
+    <path d="M194 146h85l42 40h-85z" fill="#2dd4bf" opacity=".66"/>
+  </g>
+
+  <g filter="url(#shadow)">
+    <path d="M96 174c0-18.8 15.2-34 34-34h108.5c10.6 0 20.8 5 27.3 13.4L290 185h92c18.8 0 34 15.2 34 34v183c0 18.8-15.2 34-34 34H130c-18.8 0-34-15.2-34-34z" fill="url(#back)"/>
+    <path d="M96 226c0-18.8 15.2-34 34-34h252c18.8 0 34 15.2 34 34v176c0 18.8-15.2 34-34 34H130c-18.8 0-34-15.2-34-34z" fill="url(#front)"/>
+    <path d="M96.75 226.75c0-17.9 14.5-32.4 32.4-32.4h253.7c17.9 0 32.4 14.5 32.4 32.4v175.5c0 17.9-14.5 32.4-32.4 32.4H129.15c-17.9 0-32.4-14.5-32.4-32.4z" fill="none" stroke="url(#rim)" stroke-opacity=".7" stroke-width="1.5"/>
+  </g>
+
+  <path d="M96 228h356v11H96z" fill="#073c3a" opacity=".32"/>
+  <path d="M112 208h324" stroke="#ecfeff" stroke-opacity=".22" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- The D is cut as a solid counterform so it stays legible at 16 px. -->
+  <path fill="#ffffff" fill-rule="evenodd" d="M184 268h75c54.2 0 94 34.8 94 84s-39.8 84-94 84h-75zm40 35v98h35c34.2 0 54-19.8 54-49s-19.8-49-54-49z"/>
+
+  <!-- Depth ticks echo the three stacked sheets. -->
+  <g fill="none" stroke="#ecfeff" stroke-linecap="round">
+    <path d="M366 268h22" stroke-width="8" opacity=".9"/>
+    <path d="M366 292h14" stroke-width="6" opacity=".5"/>
+    <path d="M366 312h20" stroke-width="5" opacity=".28"/>
+  </g>
+</svg>

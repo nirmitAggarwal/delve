@@ -20,7 +20,8 @@ pub struct Sidebar {
     tag_filter_text: Rc<RefCell<String>>,
     tag_filter_visible: Cell<bool>,
     match_all_btn: gtk::ToggleButton,
-    sort_btn: gtk::MenuButton,
+    sort_row: gtk::Box,
+    order_btn: gtk::Button,
     sort_label: gtk::Label,
     settings_row: gtk::Button,
 }
@@ -81,15 +82,16 @@ impl Sidebar {
 
         // Compact sort control: current field plus its direction, directly in
         // the sidebar so sorting never needs the command bar.
+        let sort_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        sort_row.set_margin_start(10);
+        sort_row.set_margin_end(10);
+        sort_row.set_margin_top(2);
+        sort_row.set_margin_bottom(6);
         let sort_btn = gtk::MenuButton::new();
         sort_btn.add_css_class("sort-pill");
         sort_btn.set_tooltip_text(Some("Sort this folder"));
-        sort_btn.set_hexpand(false);
-        sort_btn.set_halign(gtk::Align::Start);
-        sort_btn.set_margin_start(10);
-        sort_btn.set_margin_end(10);
-        sort_btn.set_margin_top(2);
-        sort_btn.set_margin_bottom(6);
+        sort_btn.set_hexpand(true);
+        sort_btn.set_halign(gtk::Align::Fill);
         let sort_body = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let sort_label = gtk::Label::new(Some("Name"));
         sort_label.add_css_class("sort-pill-label");
@@ -112,7 +114,26 @@ impl Sidebar {
                 }
             });
         }
-        // The pill is appended by `sync()` (inside the scrollable content);
+        // A separate direction toggle sits to the right of the field pill.
+        let order_btn = gtk::Button::from_icon_name("pan-up-symbolic");
+        order_btn.add_css_class("sort-pill");
+        order_btn.add_css_class("sort-order");
+        order_btn.set_tooltip_text(Some("Ascending — click for descending"));
+        order_btn.set_valign(gtk::Align::Center);
+        {
+            let strong = Rc::downgrade(app);
+            order_btn.connect_clicked(move |_| {
+                if let Some(app) = strong.upgrade() {
+                    if let Some(tab) = app.active_tab() {
+                        let sort = tab.state.borrow().sort;
+                        app.set_sort(tab.id, sort.field, !sort.ascending, sort.folders_first);
+                    }
+                }
+            });
+        }
+        sort_row.append(&sort_btn);
+        sort_row.append(&order_btn);
+        // The row is appended by `sync()` (inside the scrollable content);
         // appending it here as well would parent it twice.
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -188,7 +209,8 @@ impl Sidebar {
             tag_filter_text: tag_filter_text.clone(),
             tag_filter_visible: Cell::new(false),
             match_all_btn,
-            sort_btn,
+            sort_row,
+            order_btn,
             sort_label,
             settings_row: settings_row.clone(),
         };
@@ -211,7 +233,7 @@ impl Sidebar {
         self.outer.set_size_request(if mini { 60 } else { 180 }, -1);
         self.title.set_visible(!mini);
         self.logo.set_visible(!mini);
-        self.sort_btn.set_visible(!mini);
+        self.sort_row.set_visible(!mini);
         self.tag_search.set_visible(!mini && self.tag_filter_visible.get());
         self.toggle.set_icon_name(if mini {
             "pan-end-symbolic"
@@ -247,14 +269,20 @@ impl Sidebar {
                 let state = tab.state.borrow();
                 (state.sort.field, state.sort.ascending)
             };
-            self.sort_label.set_text(&format!(
-                "{} {}",
-                field.label(),
-                if ascending { "↑" } else { "↓" }
-            ));
+            self.sort_label.set_text(field.label());
+            self.order_btn.set_icon_name(if ascending {
+                "pan-up-symbolic"
+            } else {
+                "pan-down-symbolic"
+            });
+            self.order_btn.set_tooltip_text(Some(if ascending {
+                "Ascending — click for descending"
+            } else {
+                "Descending — click for ascending"
+            }));
         }
-        self.sort_btn.set_visible(!mini);
-        self.content.append(&self.sort_btn);
+        self.sort_row.set_visible(!mini);
+        self.content.append(&self.sort_row);
         self.tag_search.set_visible(!mini && self.tag_filter_visible.get());
         self.content.append(&self.tag_search);
         self.content.append(&self.match_all_btn);
@@ -265,8 +293,9 @@ impl Sidebar {
             if !dir.is_dir() {
                 return;
             }
-            let loc = Location::Path(dir);
+            let loc = Location::Path(dir.clone());
             let row = nav_row(app, icon, label, None);
+            tint_nav_icon(app, &row, &dir);
             set_active(&row, &active == &loc);
             install_place_drop(app, &row, match &loc {
                 Location::Path(p) => Some(p.clone()),
@@ -286,6 +315,7 @@ impl Sidebar {
         {
             let loc = Location::Home;
             let row = nav_row(app, "user-home", "Home", None);
+            tint_nav_icon(app, &row, &crate::paths::home());
             set_active(&row, &active == &loc);
             install_place_drop(app, &row, Some(crate::paths::home()));
             row.connect_clicked({
@@ -559,6 +589,14 @@ fn apply_nav_mini(row: &gtk::Button, mini: bool) {
     }
 }
 
+fn tint_nav_icon(app: &Rc<App>, row: &gtk::Button, path: &std::path::Path) {
+    let Some(color) = app.meta.borrow().folder_color(path) else { return };
+    let Some(body) = row.child().and_then(|c| c.downcast::<gtk::Box>().ok()) else { return };
+    if let Some(image) = body.first_child().and_then(|c| c.downcast::<gtk::Image>().ok()) {
+        image.add_css_class(&format!("tintfg-{}", crate::theme::color_class(&color)));
+    }
+}
+
 fn set_active(row: &gtk::Button, active: bool) {
     if active {
         row.add_css_class("active");
@@ -598,6 +636,47 @@ fn install_place_drop(app: &Rc<App>, row: &gtk::Button, dest: Option<std::path::
     row.add_controller(target);
 }
 
+fn tag_hover_popover(row: &gtk::Button, name: &str, count: usize) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_parent(row);
+    popover.set_has_arrow(true);
+    popover.set_position(gtk::PositionType::Right);
+    popover.set_autohide(false);
+    popover.set_can_target(false);
+    popover.add_css_class("tag-hover-popover");
+
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    card.add_css_class("tag-hover-card");
+    let title = gtk::Label::new(Some(name));
+    title.add_css_class("tag-popover-title");
+    title.set_xalign(0.0);
+    title.set_wrap(true);
+    title.set_max_width_chars(28);
+    card.append(&title);
+    let detail = gtk::Label::new(Some(&format!(
+        "{count} tagged item{}",
+        if count == 1 { "" } else { "s" }
+    )));
+    detail.add_css_class("tiny");
+    detail.add_css_class("dim");
+    detail.set_xalign(0.0);
+    card.append(&detail);
+
+    // Two nested revealers combine a soft fade with a small horizontal slide.
+    let slide = gtk::Revealer::new();
+    slide.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+    slide.set_transition_duration(140);
+    slide.set_reveal_child(true);
+    slide.set_child(Some(&card));
+    let fade = gtk::Revealer::new();
+    fade.set_transition_type(gtk::RevealerTransitionType::Crossfade);
+    fade.set_transition_duration(120);
+    fade.set_reveal_child(true);
+    fade.set_child(Some(&slide));
+    popover.set_child(Some(&fade));
+    popover
+}
+
 fn rebuild_tags(app: &Rc<App>, container: &gtk::Box, filter: &str) {
     let mut child = container.first_child();
     while let Some(c) = child {
@@ -632,12 +711,14 @@ fn rebuild_tags(app: &Rc<App>, container: &gtk::Box, filter: &str) {
         row.set_has_frame(false);
         let b = gtk::Box::new(gtk::Orientation::Horizontal, if mini { 0 } else { 8 });
         b.set_halign(if mini { gtk::Align::Center } else { gtk::Align::Fill });
-        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        dot.add_css_class("color-dot");
-        dot.add_css_class(&format!("swatch-{}", crate::theme::color_class(&tag.color)));
-        dot.set_valign(gtk::Align::Center);
-        dot.set_size_request(if mini { 14 } else { 9 }, if mini { 14 } else { 9 });
-        b.append(&dot);
+        // Each tag carries its own symbolic icon, tinted with the tag colour so
+        // the sidebar stays compact while remaining easy to scan.
+        let icon = gtk::Image::from_icon_name(&tag.icon);
+        icon.set_pixel_size(if mini { 16 } else { 14 });
+        icon.add_css_class("tag-icon");
+        icon.add_css_class(&format!("tintfg-{}", crate::theme::color_class(&tag.color)));
+        icon.set_valign(gtk::Align::Center);
+        b.append(&icon);
         let text = gtk::Label::new(Some(&tag.name));
         text.set_xalign(0.0);
         text.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -700,6 +781,54 @@ fn rebuild_tags(app: &Rc<App>, container: &gtk::Box, filter: &str) {
             });
         }
         row.add_controller(target.clone());
+
+        // Hover discovery: a non-interactive popover shows the complete name
+        // (which may be ellipsized in the sidebar) and the tagged item count.
+        let popover = tag_hover_popover(&row, &tag.name, count);
+        let motion = gtk::EventControllerMotion::new();
+        {
+            let popover = popover.clone();
+            motion.connect_enter(move |_, _, _| {
+                let fade = popover
+                    .child()
+                    .and_then(|c| c.downcast::<gtk::Revealer>().ok());
+                let slide = fade
+                    .as_ref()
+                    .and_then(|outer| outer.child())
+                    .and_then(|c| c.downcast::<gtk::Revealer>().ok());
+                if let Some(fade) = &fade {
+                    fade.set_reveal_child(false);
+                }
+                if let Some(slide) = &slide {
+                    slide.set_reveal_child(false);
+                }
+                popover.popup();
+                let fade = fade.clone();
+                let slide = slide.clone();
+                gtk4::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(16),
+                    move || {
+                        if let Some(fade) = &fade {
+                            fade.set_reveal_child(true);
+                        }
+                        if let Some(slide) = &slide {
+                            slide.set_reveal_child(true);
+                        }
+                    },
+                );
+            });
+        }
+        {
+            let popover = popover.clone();
+            motion.connect_leave(move |_| {
+                popover.popdown();
+            });
+        }
+        row.add_controller(motion);
+        {
+            let popover = popover.clone();
+            row.connect_destroy(move |_| popover.popdown());
+        }
         container.append(&row);
     }
 }

@@ -238,6 +238,7 @@ impl App {
                 {
                     let mut settings = self.settings.borrow_mut();
                     settings.add_recent_location(path);
+                    settings.record_visit(path);
                     settings.save();
                 }
             }
@@ -852,6 +853,9 @@ impl App {
         }
         self.sync_views(tab_id);
         self.refresh_ui();
+        // Keep the sidebar pill and its direction button in lockstep with the
+        // actual SortSpec after any sort change.
+        self.refresh_sidebar();
     }
 
     pub fn toggle_hidden(self: &Rc<Self>) {
@@ -1212,6 +1216,27 @@ impl App {
     }
 
     pub fn refresh_after_metadata_change(self: &Rc<Self>) {
+        // Tag and folder colours share one generated stylesheet, so rebuild it
+        // whenever metadata changes (new tags, recolours, custom folder HEX).
+        {
+            let meta = self.meta.borrow();
+            let mut colors: Vec<String> = meta
+                .items
+                .values()
+                .filter_map(|item| item.folder_color.clone())
+                .collect();
+            colors.extend(meta.tags.iter().map(|tag| tag.color.clone()));
+            drop(meta);
+            let settings = self.settings.borrow().clone();
+            colors.extend(
+                settings
+                    .custom_folder_icons
+                    .keys()
+                    .filter(|key| *key != "default")
+                    .cloned(),
+            );
+            self.theme.apply_folder_colors(&colors, &settings);
+        }
         if let Some(tab) = self.active_tab() {
             self.sync_views(tab.id);
             self.ui().inspector_widget.update(self, tab.id);

@@ -101,8 +101,10 @@ properties for lengths, so Delve inserts these values textually.
 | `small_size` | `9pt` | Small labels |
 | `title_size` | `12pt` | Headings |
 
-Settings for UI font, mono font, accent, and transparency are applied on top of
-the theme and override the corresponding tokens.
+Settings for UI font, mono font, accent, and background opacity are applied on
+top of the theme and override the corresponding tokens. Opacity applies alpha
+to window and panel background surfaces only; text, icons, hover and selection
+colours are not faded.
 
 ## style.css
 

@@ -144,7 +144,6 @@ pub struct Ui {
     pub view_btn_icon: gtk::Image,
     pub view_btn_label: gtk::Label,
     pub settings_btn: gtk::Button,
-    pub sort_btn: gtk::MenuButton,
     pub more_btn: gtk::MenuButton,
     pub inspector_btn: gtk::ToggleButton,
     pub cmd_new: gtk::Button,
@@ -178,8 +177,10 @@ pub struct Ui {
     pub search_filters: RefCell<SearchFilters>,
     pub scroll_accum: Cell<f64>,
     pub last_width: Cell<i32>,
-    pub sort_popover: gtk::Popover,
     pub columns_popover: gtk::Popover,
+    pub runner: Rc<crate::runner::Runner>,
+    /// Home for the runner widget when it is not in its detached window.
+    pub runner_slot: gtk::Box,
 }
 
 pub struct App {
@@ -210,6 +211,11 @@ pub struct App {
     pub watchers: RefCell<Vec<gio::FileMonitor>>,
     /// Coalesces bursts of filesystem events into one refresh.
     pub fs_pending: Cell<bool>,
+    /// The detached command-output window, when open.
+    pub runner_popout: RefCell<Option<gtk::Window>>,
+    /// True while the Shift+S quick-run prefix is waiting for a digit.
+    pub command_prefix: Cell<bool>,
+    pub command_prefix_serial: Cell<u64>,
 }
 
 impl App {
@@ -217,8 +223,24 @@ impl App {
         crate::paths::ensure_dirs();
         let settings = Settings::load();
         let meta = Metadata::load();
+        let mut saved_folder_colors: Vec<String> = meta
+            .items
+            .values()
+            .filter_map(|item| item.folder_color.clone())
+            .collect();
+        saved_folder_colors.extend(meta.tags.iter().map(|tag| tag.color.clone()));
+        saved_folder_colors.extend(
+            settings
+                .custom_folder_icons
+                .keys()
+                .filter(|key| *key != "default")
+                .cloned(),
+        );
         let display = gdk::Display::default().expect("Delve requires a graphical display");
         let theme = ThemeManager::new(&display, &settings);
+        // Reload saved folder colours into the dynamic stylesheet on startup;
+        // otherwise their tint classes have no definition after a restart.
+        theme.apply_folder_colors(&saved_folder_colors, &settings);
         crate::theme::apply_icon_theme(&settings.icon_theme);
 
         let window = gtk::ApplicationWindow::builder()
@@ -227,6 +249,7 @@ impl App {
             .default_width(settings.window_width)
             .default_height(settings.window_height)
             .build();
+        window.set_icon_name(Some("io.github.delve.FileManager"));
         window.add_css_class("delve");
         window.set_size_request(480, 340);
         if settings.window_maximized {
@@ -257,8 +280,12 @@ impl App {
             thumb_refresh_scheduled: Cell::new(false),
             watchers: RefCell::new(Vec::new()),
             fs_pending: Cell::new(false),
+            runner_popout: RefCell::new(None),
+            command_prefix: Cell::new(false),
+            command_prefix_serial: Cell::new(0),
         });
         app.build_ui();
+        app.apply_window_opacity();
         crate::dispatch::install(&app);
         app.install_actions();
         app.install_shortcut_tracker();
@@ -282,6 +309,46 @@ impl App {
 
     pub fn ui(&self) -> &Ui {
         self.ui.get().expect("UI built during App::new")
+    }
+
+    /// Apply background opacity live. This deliberately resets whole-widget
+    /// opacity and lets the theme override only surface backgrounds, so text,
+    /// icons and hover/selection states stay fully opaque.
+    pub fn apply_window_opacity(&self) {
+        self.window.set_opacity(1.0);
+        let settings = self.settings.borrow().clone();
+        self.theme.apply_overrides(&settings);
+    }
+
+    /// Rebuild the visible entry views after icon rules change. Custom icons
+    /// also suppress thumbnails, so a full sync (not just a repaint) is needed.
+    /// Reusing the metadata refresh path keeps colour swatches for new folder
+    /// icon rules defined in the dynamic stylesheet.
+    pub fn refresh_after_icon_change(self: &Rc<Self>) {
+        self.refresh_after_metadata_change();
+    }
+
+    /// Whether a text control currently owns the keyboard. The Shift+S prefix
+    /// must never steal a capital S from a search field, path entry or editor.
+    fn text_input_focused(&self) -> bool {
+        let Some(focus) = gtk::prelude::GtkWindowExt::focus(&self.window) else {
+            return false;
+        };
+        // GtkSearchEntry and some other composite controls put focus on an
+        // internal child, so inspect the whole ancestor chain.
+        let mut widget = Some(focus);
+        while let Some(current) = widget {
+            if current.is::<gtk::Entry>()
+                || current.is::<gtk::SearchEntry>()
+                || current.is::<gtk::TextView>()
+                || current.is::<gtk::Text>()
+                || current.is::<gtk::SpinButton>()
+            {
+                return true;
+            }
+            widget = current.parent();
+        }
+        false
     }
 
     pub fn active_tab(&self) -> Option<Rc<Tab>> {
@@ -318,6 +385,7 @@ impl App {
         let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
         shell.add_css_class("delve-shell");
         shell.set_vexpand(true);
+        let runner = crate::runner::Runner::new(self);
 
         // --- Tab bar -------------------------------------------------------
         let tab_strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
@@ -526,6 +594,36 @@ impl App {
         commandbar.append(&view_btn);
         // Open the configured terminal in the current folder, right next to the
         // view switcher.
+        let runs_btn = gtk::Button::from_icon_name("system-run-symbolic");
+        runs_btn.add_css_class("toolbar-button");
+        runs_btn.set_tooltip_text(Some("Run commands panel (Ctrl+Shift+R)"));
+        {
+            let runner = runner.clone();
+            runs_btn.connect_clicked(move |_| {
+                runner.reveal(!runner.root.reveals_child());
+            });
+        }
+        commandbar.append(&runs_btn);
+        let command_sets_btn = gtk::Button::from_icon_name("view-list-symbolic");
+        command_sets_btn.add_css_class("toolbar-button");
+        command_sets_btn.set_tooltip_text(Some("Choose command sets (Shift+S, 0)"));
+        {
+            let weak = Rc::downgrade(self);
+            command_sets_btn.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    if let Some(folder) = app.active_location().path().cloned() {
+                        crate::dialogs::run_commands_picker(
+                            &app,
+                            folder,
+                            app.selected_paths(),
+                        );
+                    } else {
+                        app.notify("Open a folder before running command sets.", true);
+                    }
+                }
+            });
+        }
+        commandbar.append(&command_sets_btn);
         let terminal_btn = gtk::Button::from_icon_name("utilities-terminal-symbolic");
         terminal_btn.add_css_class("toolbar-button");
         terminal_btn.set_tooltip_text(Some("Open terminal here (Ctrl+Shift+E)"));
@@ -552,11 +650,6 @@ impl App {
             });
         }
         commandbar.append(&hidden_btn);
-        let sort_btn = gtk::MenuButton::new();
-        sort_btn.set_icon_name("view-sort-descending-symbolic");
-        sort_btn.add_css_class("flat");
-        sort_btn.set_tooltip_text(Some("Sort and columns"));
-        commandbar.append(&sort_btn);
         commandbar.append(&inspector_btn);
         let settings_btn = gtk::Button::from_icon_name("emblem-system-symbolic");
         settings_btn.add_css_class("toolbar-button");
@@ -603,6 +696,9 @@ impl App {
         outer_paned.set_position(ui_settings.sidebar_width);
         outer_paned.set_vexpand(true);
         shell.append(&outer_paned);
+        let runner_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        runner_slot.append(&runner.root);
+        shell.append(&runner_slot);
 
         // --- Drawers (narrow layout) --------------------------------------
         let drawer_left_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -713,7 +809,6 @@ impl App {
             view_btn_icon,
             view_btn_label,
             settings_btn,
-            sort_btn,
             more_btn,
             inspector_btn,
             cmd_new,
@@ -747,8 +842,9 @@ impl App {
             search_filters: RefCell::new(SearchFilters::default()),
             scroll_accum: Cell::new(0.0),
             last_width: Cell::new(0),
-            sort_popover: gtk::Popover::new(),
             columns_popover: gtk::Popover::new(),
+            runner: runner.clone(),
+            runner_slot,
         };
         let _ = self.ui.set(ui);
         self.install_ui_signals();
@@ -944,17 +1040,6 @@ impl App {
             });
             scrim.add_controller(gesture);
         }
-        // Sort popover
-        {
-            let popover = self.ui().sort_popover.clone();
-            self.ui().sort_btn.set_popover(Some(&popover));
-            let weak = Rc::downgrade(self);
-            popover.connect_show(move |p| {
-                if let Some(app) = weak.upgrade() {
-                    app.fill_sort_popover(p);
-                }
-            });
-        }
         // More popover
         {
             let popover = gtk::Popover::new();
@@ -1024,6 +1109,7 @@ impl App {
                     settings.save();
                 }
                 app.meta.borrow().save();
+                app.ui().runner.shutdown();
             }
             glib::Propagation::Proceed
         });
@@ -1058,7 +1144,39 @@ impl App {
             if let Some(app) = weak.upgrade() {
                 app.last_modifiers.set(state);
                 if keyval == gdk::Key::Escape {
+                    app.command_prefix.set(false);
                     return app.handle_escape();
+                }
+                // Shift+S is a prefix, not a normal accelerator: after it, a
+                // digit starts the matching command set (0 opens the picker).
+                if app.command_prefix.get() {
+                    if let Some(slot) = command_shortcut_digit(keyval) {
+                        app.command_prefix.set(false);
+                        app.run_command_slot(slot);
+                        return glib::Propagation::Stop;
+                    }
+                    app.command_prefix.set(false);
+                }
+                let blocking_modifiers = gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SUPER_MASK;
+                if !app.text_input_focused()
+                    && state.contains(gdk::ModifierType::SHIFT_MASK)
+                    && !state.intersects(blocking_modifiers)
+                    && matches!(keyval, gdk::Key::s | gdk::Key::S)
+                {
+                    app.command_prefix.set(true);
+                    let serial = app.command_prefix_serial.get() + 1;
+                    app.command_prefix_serial.set(serial);
+                    let weak = Rc::downgrade(&app);
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+                        if let Some(app) = weak.upgrade() {
+                            if app.command_prefix_serial.get() == serial {
+                                app.command_prefix.set(false);
+                            }
+                        }
+                    });
+                    return glib::Propagation::Stop;
                 }
             }
             glib::Propagation::Proceed
@@ -1391,7 +1509,18 @@ impl App {
                 } else {
                     crate::util::ellipsize(label_text, 22)
                 };
-                button.set_label(&text);
+                let crumb_body = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                if let Some(color) = self.meta.borrow().folder_color(path) {
+                    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    dot.add_css_class("color-dot");
+                    dot.add_css_class(&format!("swatch-{}", crate::theme::color_class(&color)));
+                    dot.set_size_request(6, 6);
+                    dot.set_valign(gtk::Align::Center);
+                    crumb_body.append(&dot);
+                }
+                let crumb_text = gtk::Label::new(Some(&text));
+                crumb_body.append(&crumb_text);
+                button.set_child(Some(&crumb_body));
                 button.add_css_class("crumb");
                 if i == last_index {
                     button.add_css_class("current");
@@ -1595,6 +1724,68 @@ impl App {
         ui.left_drawer.set_reveal_child(false);
     }
 
+    /// Open the run panel in its own window. The runner widget is moved, not
+    /// copied, so sessions and output continue uninterrupted in both places.
+    pub fn open_runner_popout(self: &Rc<Self>) {
+        if let Some(window) = self.runner_popout.borrow().as_ref() {
+            window.present();
+            return;
+        }
+        let slot = self.ui().runner_slot.clone();
+        let root = self.ui().runner.root.clone();
+        let slot_widget: gtk::Widget = slot.clone().upcast();
+        if root.parent().as_ref() == Some(&slot_widget) {
+            slot.remove(&root);
+        }
+
+        let window = gtk::Window::builder()
+            .title("Delve command runs")
+            .transient_for(&self.window)
+            .default_width(760)
+            .default_height(460)
+            .build();
+        window.add_css_class("delve-dialog");
+        window.set_destroy_with_parent(true);
+        root.set_vexpand(true);
+        self.ui().runner.reveal(true);
+        window.set_child(Some(&root));
+        *self.runner_popout.borrow_mut() = Some(window.clone());
+
+        let weak = Rc::downgrade(self);
+        window.connect_close_request(move |window| {
+            if let Some(child) = window.child() {
+                window.set_child(None::<&gtk::Widget>);
+                child.set_vexpand(false);
+                slot.append(&child);
+            }
+            if let Some(app) = weak.upgrade() {
+                app.runner_popout.borrow_mut().take();
+            }
+            glib::Propagation::Proceed
+        });
+        window.present();
+    }
+
+    pub fn toggle_runner_popout(self: &Rc<Self>) {
+        let window = self.runner_popout.borrow().clone();
+        if let Some(window) = window {
+            window.close();
+        } else {
+            self.open_runner_popout();
+        }
+    }
+
+    /// Hide the run surface: close the detached window when there is one,
+    /// otherwise collapse the docked panel.
+    pub fn hide_runner(self: &Rc<Self>) {
+        let window = self.runner_popout.borrow().clone();
+        if let Some(window) = window {
+            window.close();
+        } else {
+            self.ui().runner.reveal(false);
+        }
+    }
+
     pub fn close_drawers(self: &Rc<Self>) {
         let ui = self.ui();
         ui.left_drawer.set_reveal_child(false);
@@ -1699,6 +1890,24 @@ impl Ui {
         self.scrim.set_visible(false);
         self.left_drawer.set_visible(false);
         self.right_drawer.set_visible(false);
+    }
+}
+
+/// Map the number row (with or without Shift) to a command slot. Zero is the
+/// special “choose sets” slot.
+fn command_shortcut_digit(keyval: gdk::Key) -> Option<u8> {
+    match keyval.to_unicode()? {
+        '0' => Some(0),
+        '1' | '!' => Some(1),
+        '2' | '@' => Some(2),
+        '3' | '#' => Some(3),
+        '4' | '$' => Some(4),
+        '5' | '%' => Some(5),
+        '6' | '^' => Some(6),
+        '7' | '&' => Some(7),
+        '8' | '*' => Some(8),
+        '9' | '(' => Some(9),
+        _ => None,
     }
 }
 

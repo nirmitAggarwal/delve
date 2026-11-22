@@ -430,19 +430,27 @@ impl IconView {
         b.add_css_class("icon-cell");
         b.set_halign(gtk::Align::Center);
         b.set_valign(gtk::Align::Start);
-        // A single fixed cell size keeps every item aligned whether its
-        // artwork is a thumbnail or a plain icon.
-        b.set_size_request(icon_size + 46, icon_size + 64);
+        // Every item has identical geometry: the cell, artwork holder, name row
+        // and metadata row all have fixed requests, so a thumbnail's natural
+        // size can never change the grid. FlowBox is homogeneous as well.
+        let cell_width = icon_size + 46;
+        b.set_size_request(cell_width, icon_size + 64);
+        b.set_hexpand(false);
 
         let image = entry_icon(app, entry, icon_size);
         let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         holder.set_halign(gtk::Align::Center);
         holder.set_valign(gtk::Align::Center);
         holder.set_size_request(icon_size + 8, icon_size + 8);
+        holder.set_hexpand(false);
+        holder.set_vexpand(false);
+        holder.set_overflow(gtk::Overflow::Hidden);
         holder.set_widget_name("thumb-holder");
         holder.append(&image);
         b.append(&holder);
-        if entry.is_image() || entry.is_video() || entry.is_pdf() {
+        if !super::has_custom_icon(app, entry)
+            && (entry.is_image() || entry.is_video() || entry.is_pdf())
+        {
             let holder_widget: gtk::Widget = holder.clone().upcast();
             self.images
                 .borrow_mut()
@@ -450,7 +458,10 @@ impl IconView {
         }
 
         let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        name_row.set_halign(gtk::Align::Center);
+        // Fill the cell and centre the text inside it. A centred box would
+        // shrink to the label's natural width and leave names visually offset
+        // from their icons.
+        name_row.set_halign(gtk::Align::Fill);
         if show_tags {
             let meta = app.meta.borrow();
             if let Some(color) = meta.tag_names_for(&entry.path).first().and_then(|_| {
@@ -465,15 +476,21 @@ impl IconView {
                 name_row.append(&dot);
             }
         }
-        name_row.set_size_request(-1, 34);
+        name_row.set_size_request(cell_width, 20);
         let label = gtk::Label::new(Some(&entry.name));
         label.add_css_class("icon-label");
+        // Names stay on one line and shorten in the middle, so a long file
+        // such as ndrjnrodfgdhrxvsuviud.png reads as ndr…d.png instead of
+        // wrapping or losing only its extension.
         label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         label.set_max_width_chars(18);
-        label.set_lines(2);
-        label.set_wrap(true);
-        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_lines(1);
+        label.set_wrap(false);
+        label.set_single_line_mode(true);
         label.set_justify(gtk::Justification::Center);
+        label.set_halign(gtk::Align::Center);
+        label.set_xalign(0.5);
+        label.set_hexpand(true);
         name_row.append(&label);
         b.append(&name_row);
 
@@ -485,7 +502,9 @@ impl IconView {
         meta_label.add_css_class("icon-meta");
         meta_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         meta_label.set_max_width_chars(20);
-        meta_label.set_size_request(-1, 16);
+        meta_label.set_halign(gtk::Align::Center);
+        meta_label.set_xalign(0.5);
+        meta_label.set_size_request(cell_width, 16);
         b.append(&meta_label);
 
         b.set_tooltip_text(Some(&format!(
@@ -564,12 +583,16 @@ impl IconView {
             while let Some(child) = holder.first_child() {
                 holder.remove(&child);
             }
-            let pic = gtk::Picture::for_paintable(&texture);
-            pic.set_content_fit(gtk::ContentFit::Contain);
-            pic.set_can_shrink(true);
-            pic.set_size_request(icon_size + 2, icon_size + 2);
+            // GtkImage requests exactly `pixel_size` and scales the paintable
+            // proportionally inside that square. Unlike GtkPicture, its natural
+            // size cannot grow the cell when the source photo is very tall or
+            // wide, which is what keeps the grid perfectly uniform.
+            let pic = gtk::Image::from_paintable(Some(&texture));
+            pic.set_pixel_size(icon_size);
             pic.set_halign(gtk::Align::Center);
             pic.set_valign(gtk::Align::Center);
+            pic.set_hexpand(false);
+            pic.set_vexpand(false);
             holder.append(&pic);
             fade_in(&pic);
         }

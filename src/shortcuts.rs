@@ -32,6 +32,8 @@ pub const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("settings", "<Control>comma", "Settings"),
     ("properties", "<Alt>Return", "Properties"),
     ("terminal", "<Control><Shift>e", "Open in terminal"),
+    ("runs", "<Control><Shift>r", "Toggle run panel"),
+    ("spotlight", "<Super>space", "Quick Spotlight"),
     ("organise", "<Control><Shift>o", "Organise folder"),
     ("compress", "<Control><Shift>c", "Compress selection"),
     ("sidebar", "F9", "Toggle sidebar"),

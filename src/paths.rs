@@ -58,6 +58,12 @@ pub fn metadata_file() -> PathBuf {
     data_dir().join("metadata.json")
 }
 
+/// Uploaded icon assets. Kept beside metadata rather than in the cache so
+/// custom icons survive cache cleanup and configuration export.
+pub fn icons_dir() -> PathBuf {
+    data_dir().join("icons")
+}
+
 pub fn thumbnails_dir() -> PathBuf {
     cache_dir().join("thumbnails")
 }
@@ -69,7 +75,14 @@ pub fn log_file() -> PathBuf {
 /// Create the XDG directories Delve uses. Failures are tolerated: the app still
 /// runs, features that need a directory report their own errors.
 pub fn ensure_dirs() {
-    for dir in [config_dir(), data_dir(), cache_dir(), themes_dir(), thumbnails_dir()] {
+    for dir in [
+        config_dir(),
+        data_dir(),
+        cache_dir(),
+        themes_dir(),
+        icons_dir(),
+        thumbnails_dir(),
+    ] {
         let _ = std::fs::create_dir_all(&dir);
     }
 }

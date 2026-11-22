@@ -4,13 +4,15 @@
 use crate::app::App;
 use crate::fs::{self, Entry, SortField};
 use crate::settings::{
-    ConflictPolicy, CwdRule, Density, RunCommand, Settings, ViewKind,
+    ConflictPolicy, CwdRule, Density, LaunchMode, RunCommand, RunMode, RunScope, RunStep, Settings,
+    ViewKind,
 };
 use gtk4 as gtk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -135,6 +137,9 @@ pub fn confirm<F>(
         });
     }
     window.present();
+    // Keyboard-first: the confirming action receives focus so Enter runs the
+    // command profile immediately after the user has reviewed it.
+    ok.grab_focus();
 }
 
 pub fn name_dialog<F>(
@@ -1652,8 +1657,129 @@ pub fn assign_tags_dialog(app: &Rc<App>, paths: Vec<PathBuf>) {
     window.present();
 }
 
+/// Assign a folder colour. This is a real dialog rather than a popover anchored
+/// inside the context menu: the old nested popover was parented to a menu item
+/// that had already been popped down, which is what produced the flicker and
+/// swallowed clicks.
+pub fn folder_color_dialog(app: &Rc<App>, paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let window = dialog_window(
+        app,
+        if paths.len() == 1 { "Folder colour" } else { "Folder colours" },
+        440,
+        330,
+    );
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.set_margin_top(14);
+    root.set_margin_bottom(12);
+    root.set_margin_start(14);
+    root.set_margin_end(14);
+    root.append(&header(
+        "Folder colour",
+        "Colours are stored by Delve and never modify the folder itself.",
+    ));
+    let current = paths
+        .first()
+        .and_then(|p| app.meta.borrow().folder_color(p))
+        .unwrap_or_default();
+
+    let grid = gtk::Grid::builder()
+        .column_spacing(6)
+        .row_spacing(6)
+        .build();
+    for (index, (name, hex)) in crate::theme::FOLDER_PALETTE.iter().enumerate() {
+        let button = gtk::Button::new();
+        button.add_css_class("flat");
+        button.set_tooltip_text(Some(*name));
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("color-dot");
+        dot.add_css_class(&format!("swatch-{}", crate::theme::color_class(hex)));
+        dot.set_size_request(26, 26);
+        button.set_child(Some(&dot));
+        if current.eq_ignore_ascii_case(hex) {
+            button.add_css_class("suggested");
+        }
+        let weak = Rc::downgrade(app);
+        let paths = paths.clone();
+        let window_ref = window.clone();
+        let hex = (*hex).to_string();
+        button.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                for path in &paths {
+                    app.set_folder_color(path, Some(hex.clone()));
+                }
+                window_ref.close();
+            }
+        });
+        grid.attach(&button, (index % 6) as i32, (index / 6) as i32, 1, 1);
+    }
+    root.append(&grid);
+
+    let custom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("#RRGGBB"));
+    entry.set_text(if current.is_empty() { "#4c8dff" } else { &current });
+    entry.set_hexpand(true);
+    custom.append(&entry);
+    let apply = gtk::Button::with_label("Apply custom colour");
+    apply.add_css_class("suggested");
+    {
+        let weak = Rc::downgrade(app);
+        let paths = paths.clone();
+        let window_ref = window.clone();
+        let entry = entry.clone();
+        apply.connect_clicked(move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            let text = entry.text().trim().to_string();
+            let valid = text.len() == 7
+                && text.starts_with('#')
+                && text[1..].chars().all(|c| c.is_ascii_hexdigit());
+            if !valid {
+                entry.add_css_class("error");
+                return;
+            }
+            entry.remove_css_class("error");
+            for path in &paths {
+                app.set_folder_color(path, Some(text.clone()));
+            }
+            window_ref.close();
+        });
+    }
+    custom.append(&apply);
+    root.append(&custom);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let reset = gtk::Button::with_label("Reset to default");
+    {
+        let weak = Rc::downgrade(app);
+        let paths = paths.clone();
+        let window_ref = window.clone();
+        reset.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                for path in &paths {
+                    app.set_folder_color(path, None);
+                }
+                window_ref.close();
+            }
+        });
+    }
+    buttons.append(&reset);
+    let cancel = gtk::Button::with_label("Cancel");
+    {
+        let window_ref = window.clone();
+        cancel.connect_clicked(move |_| window_ref.close());
+    }
+    buttons.append(&cancel);
+    root.append(&buttons);
+    window.set_child(Some(&root));
+    window.present();
+}
+
 pub fn create_tag_dialog(app: &Rc<App>) {
-    let window = dialog_window(app, "New tag", 400, 240);
+    let window = dialog_window(app, "New tag", 400, 300);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.set_margin_top(14);
     root.set_margin_bottom(12);
@@ -1681,6 +1807,22 @@ pub fn create_tag_dialog(app: &Rc<App>) {
         swatches.append(&button);
     }
     root.append(&swatches);
+    let icon_names: Vec<&str> = crate::metadata::TAG_ICONS.iter().map(|(_, label)| *label).collect();
+    let icon_drop = gtk::DropDown::from_strings(&icon_names);
+    let icon_preview = gtk::Image::from_icon_name(crate::metadata::TAG_ICONS[0].0);
+    icon_preview.set_pixel_size(18);
+    {
+        let preview = icon_preview.clone();
+        icon_drop.connect_selected_notify(move |drop| {
+            if let Some((icon, _)) = crate::metadata::TAG_ICONS.get(drop.selected() as usize) {
+                preview.set_icon_name(Some(icon));
+            }
+        });
+    }
+    let icon_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    icon_box.append(&icon_drop);
+    icon_box.append(&icon_preview);
+    root.append(&row("Icon", "Shown beside the tag in the sidebar.", &icon_box));
     let error = gtk::Label::new(None);
     error.add_css_class("danger");
     error.add_css_class("tiny");
@@ -1706,13 +1848,21 @@ pub fn create_tag_dialog(app: &Rc<App>) {
         let name = name.clone();
         let color = color.clone();
         let error = error.clone();
+        let icon_drop = icon_drop.clone();
         create.connect_clicked(move |_| {
             let Some(app) = weak.upgrade() else { return };
-            let result = app.meta.borrow_mut().create_tag(&name.text(), &color.borrow());
+            let icon = crate::metadata::TAG_ICONS
+                .get(icon_drop.selected() as usize)
+                .map(|(icon, _)| *icon)
+                .unwrap_or("tag-symbolic");
+            let result = app
+                .meta
+                .borrow_mut()
+                .create_tag_with_icon(&name.text(), &color.borrow(), icon);
             match result {
                 Ok(_) => {
                     window_ref.close();
-                    app.refresh_sidebar();
+                    app.refresh_after_metadata_change();
                     app.notify("Tag created", false);
                 }
                 Err(err) => {
@@ -1800,6 +1950,46 @@ pub fn tag_manager(app: &Rc<App>) {
                     });
                 }
                 row.append(&save);
+                let icon_btn = gtk::MenuButton::new();
+                icon_btn.set_label("Icon");
+                icon_btn.add_css_class("flat");
+                let icon_pop = gtk::Popover::new();
+                icon_pop.set_has_arrow(false);
+                let icon_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                for (icon_name, icon_label) in crate::metadata::TAG_ICONS {
+                    let choice = gtk::Button::new();
+                    choice.add_css_class("flat");
+                    let body = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    let image = gtk::Image::from_icon_name(icon_name);
+                    image.set_pixel_size(16);
+                    body.append(&image);
+                    let label = gtk::Label::new(Some(*icon_label));
+                    label.set_xalign(0.0);
+                    body.append(&label);
+                    choice.set_child(Some(&body));
+                    {
+                        let weak = Rc::downgrade(&app);
+                        let refresh = refresh.clone();
+                        let id = tag.id.clone();
+                        let icon_name = (*icon_name).to_string();
+                        let icon_pop = icon_pop.clone();
+                        choice.connect_clicked(move |_| {
+                            if let Some(app) = weak.upgrade() {
+                                app.meta.borrow_mut().set_tag_icon(&id, &icon_name);
+                                app.refresh_sidebar();
+                                app.refresh_after_metadata_change();
+                                icon_pop.popdown();
+                                if let Some(f) = refresh.borrow().as_ref() {
+                                    f();
+                                }
+                            }
+                        });
+                    }
+                    icon_list.append(&choice);
+                }
+                icon_pop.set_child(Some(&icon_list));
+                icon_btn.set_popover(Some(&icon_pop));
+                row.append(&icon_btn);
                 let recolour = gtk::Button::with_label("Colour");
                 recolour.add_css_class("flat");
                 {
@@ -1934,7 +2124,7 @@ fn gdk_rgba(value: &str) -> gtk4::gdk::RGBA {
 
 const SECTIONS: &[(&str, &str)] = &[
     ("appearance", "Appearance"),
-    ("icons", "Icons"),
+    ("icons", "Icons & theme"),
     ("layout", "Layout"),
     ("files", "Files"),
     ("thumbnails", "Thumbnails"),
@@ -1959,7 +2149,7 @@ pub fn settings_window(app: &Rc<App>, section: Option<&str>) {
     stack.set_transition_duration(80);
     let pages: Vec<(String, gtk::Widget)> = vec![
         ("appearance".into(), appearance_page(app, &window)),
-        ("icons".into(), icons_page(app)),
+        ("icons".into(), icons_page(app, &window)),
         ("layout".into(), layout_page(app)),
         ("files".into(), files_page(app)),
         ("thumbnails".into(), thumbnails_page(app)),
@@ -2184,6 +2374,28 @@ fn appearance_page(app: &Rc<App>, window: &gtk::Window) -> gtk::Widget {
         });
     }
     inner.append(&row("Monospace font", "Used for previews and paths.", &mono_entry));
+    inner.append(&section_label("WINDOW"));
+    let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 35.0, 100.0, 1.0);
+    opacity.set_digits(0);
+    opacity.set_value((app.settings.borrow().window_opacity * 100.0).round());
+    opacity.set_size_request(220, -1);
+    opacity.set_draw_value(true);
+    opacity.set_value_pos(gtk::PositionType::Right);
+    {
+        let weak = Rc::downgrade(app);
+        opacity.connect_value_changed(move |scale| {
+            if let Some(app) = weak.upgrade() {
+                app.settings.borrow_mut().window_opacity = (scale.value() / 100.0).clamp(0.35, 1.0);
+                save(&app);
+                app.apply_window_opacity();
+            }
+        });
+    }
+    inner.append(&row(
+        "Background opacity",
+        "Only window and panel backgrounds fade. Text, icons and hover/selection states stay fully opaque.",
+        &opacity,
+    ));
     inner.append(&switch_row(
         "Translucent panels",
         "Uses alpha on panels. Turn off for fully opaque surfaces.",
@@ -2350,10 +2562,445 @@ fn appearance_page(app: &Rc<App>, window: &gtk::Window) -> gtk::Widget {
     scroller.upcast()
 }
 
-fn icons_page(app: &Rc<App>) -> gtk::Widget {
+fn clear_box(container: &gtk::Box) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+fn icon_preview_slot() -> gtk::Box {
+    let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    slot.set_size_request(30, 30);
+    slot.set_halign(gtk::Align::Center);
+    slot.set_valign(gtk::Align::Center);
+    slot.add_css_class("icon-preview");
+    slot
+}
+
+fn update_icon_preview(slot: &gtk::Box, source: Option<&str>, size: i32) {
+    clear_box(slot);
+    let image = source
+        .and_then(|value| crate::theme::custom_icon_image(value, size))
+        .unwrap_or_else(|| gtk::Image::from_icon_name("image-x-generic-symbolic"));
+    image.set_pixel_size(size);
+    if source.is_none() {
+        image.set_opacity(0.45);
+    }
+    slot.append(&image);
+}
+
+/// Shared editor for icon sources. It accepts a themed icon name, an already
+/// uploaded file source, or a new image upload copied into Delve's data folder.
+fn icon_source_dialog(
+    app: &Rc<App>,
+    parent: &gtk::Window,
+    title: &str,
+    initial: &str,
+    on_apply: Rc<dyn Fn(Option<String>)>,
+) {
+    let window = dialog_window(app, title, 500, 330);
+    window.set_transient_for(Some(parent));
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.set_margin_top(16);
+    root.set_margin_bottom(14);
+    root.set_margin_start(16);
+    root.set_margin_end(16);
+    root.append(&header(
+        title,
+        "Use an icon-theme name, or upload a PNG, JPEG, WebP or GIF.",
+    ));
+
+    let preview = icon_preview_slot();
+    update_icon_preview(&preview, (!initial.is_empty()).then_some(initial), 52);
+    let preview_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    preview_row.append(&preview);
+    let initial_label = if initial.is_empty() {
+        "No icon selected".to_string()
+    } else {
+        crate::theme::icon_source_label(initial)
+    };
+    let preview_text = gtk::Label::new(Some(&initial_label));
+    preview_text.add_css_class("tiny");
+    preview_text.add_css_class("dim");
+    preview_text.set_xalign(0.0);
+    preview_text.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    preview_text.set_hexpand(true);
+    preview_row.append(&preview_text);
+    root.append(&preview_row);
+
+    let entry = gtk::Entry::new();
+    entry.set_text(initial);
+    entry.set_placeholder_text(Some("e.g. folder-star-symbolic or file:/path/icon.png"));
+    entry.set_hexpand(true);
+    root.append(&row("Icon source", "Icon names follow the active icon theme.", &entry));
+
+    let upload = gtk::Button::with_label("Upload image…");
+    upload.set_halign(gtk::Align::Start);
+    let status = gtk::Label::new(None);
+    status.add_css_class("tiny");
+    status.add_css_class("dim");
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    {
+        let weak = Rc::downgrade(app);
+        let window_c = window.clone();
+        let entry_c = entry.clone();
+        let preview_c = preview.clone();
+        let preview_text_c = preview_text.clone();
+        let status_c = status.clone();
+        upload.connect_clicked(move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            let chooser = gtk::FileDialog::new();
+            chooser.set_title("Choose an icon image");
+            let entry_c = entry_c.clone();
+            let preview_c = preview_c.clone();
+            let preview_text_c = preview_text_c.clone();
+            let status_c = status_c.clone();
+            chooser.open(
+                Some(&window_c),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(file) = result else { return };
+                    let Some(path) = file.path() else { return };
+                    match crate::theme::import_icon_file(&path) {
+                        Ok(source) => {
+                            entry_c.set_text(&source);
+                            update_icon_preview(&preview_c, Some(&source), 52);
+                            preview_text_c.set_text(&crate::theme::icon_source_label(&source));
+                            status_c.remove_css_class("danger");
+                            status_c.set_text(&format!(
+                                "Copied into {}",
+                                crate::paths::icons_dir().display()
+                            ));
+                        }
+                        Err(err) => {
+                            status_c.add_css_class("danger");
+                            status_c.set_text(&err);
+                        }
+                    }
+                    let _ = &app;
+                },
+            );
+        });
+    }
+    root.append(&upload);
+    root.append(&status);
+
+    {
+        let preview = preview.clone();
+        let preview_text = preview_text.clone();
+        entry.connect_changed(move |entry| {
+            let source = entry.text().trim().to_string();
+            update_icon_preview(&preview, (!source.is_empty()).then_some(source.as_str()), 52);
+            let label = if source.is_empty() {
+                "No icon selected".to_string()
+            } else {
+                crate::theme::icon_source_label(&source)
+            };
+            preview_text.set_text(&label);
+        });
+    }
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.set_margin_top(4);
+    let remove = gtk::Button::with_label("Remove override");
+    let cancel = gtk::Button::with_label("Cancel");
+    let apply = gtk::Button::with_label("Apply");
+    apply.add_css_class("suggested");
+    buttons.append(&remove);
+    buttons.append(&cancel);
+    buttons.append(&apply);
+    root.append(&buttons);
+    window.set_child(Some(&root));
+    {
+        let window = window.clone();
+        cancel.connect_clicked(move |_| window.close());
+    }
+    {
+        let window = window.clone();
+        let entry = entry.clone();
+        let status = status.clone();
+        let on_apply = on_apply.clone();
+        apply.connect_clicked(move |_| {
+            let source = entry.text().trim().to_string();
+            if source.is_empty() {
+                return;
+            }
+            if crate::theme::custom_icon_image(&source, 24).is_none() {
+                status.add_css_class("danger");
+                status.set_text(
+                    "That icon name was not found in the active icon theme, or the image path is missing.",
+                );
+                return;
+            }
+            on_apply(Some(source));
+            window.close();
+        });
+    }
+    {
+        let window = window.clone();
+        remove.connect_clicked(move |_| {
+            on_apply(None);
+            window.close();
+        });
+    }
+    window.present();
+}
+
+fn file_icon_rule_rows(app: &Rc<App>, parent: &gtk::Window, container: &gtk::Box) {
+    clear_box(container);
+    let rules: Vec<(String, String)> = app
+        .settings
+        .borrow()
+        .custom_file_icons
+        .iter()
+        .map(|(key, source)| (key.clone(), source.clone()))
+        .collect();
+    if rules.is_empty() {
+        let empty = gtk::Label::new(Some(
+            "No file-type overrides yet. Add one below, for example “pdf” or “image/*”.",
+        ));
+        empty.add_css_class("tiny");
+        empty.add_css_class("dim");
+        empty.set_xalign(0.0);
+        empty.set_wrap(true);
+        container.append(&empty);
+        return;
+    }
+    for (key, source) in rules {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_top(3);
+        row.set_margin_bottom(3);
+        let preview = icon_preview_slot();
+        update_icon_preview(&preview, Some(&source), 24);
+        row.append(&preview);
+        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        texts.set_hexpand(true);
+        let name = gtk::Label::new(Some(&key));
+        name.add_css_class("meta-value");
+        name.set_xalign(0.0);
+        texts.append(&name);
+        let detail = gtk::Label::new(Some(&crate::theme::icon_source_label(&source)));
+        detail.add_css_class("tiny");
+        detail.add_css_class("dim");
+        detail.set_xalign(0.0);
+        detail.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        texts.append(&detail);
+        row.append(&texts);
+        let edit = gtk::Button::with_label("Change…");
+        row.append(&edit);
+        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove.add_css_class("flat");
+        remove.set_tooltip_text(Some("Remove this icon override"));
+        row.append(&remove);
+        container.append(&row);
+
+        {
+            let weak = Rc::downgrade(app);
+            let key = key.clone();
+            let container = container.clone();
+            let parent = parent.clone();
+            edit.connect_clicked(move |_| {
+                let Some(app) = weak.upgrade() else { return };
+                let initial = app
+                    .settings
+                    .borrow()
+                    .custom_file_icons
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                let weak = Rc::downgrade(&app);
+                let key = key.clone();
+                let container = container.clone();
+                let parent = parent.clone();
+                let parent_for_dialog = parent.clone();
+                icon_source_dialog(
+                    &app,
+                    &parent_for_dialog,
+                    &format!("Icon for {key}"),
+                    &initial,
+                    Rc::new(move |source: Option<String>| {
+                        let Some(app) = weak.upgrade() else { return };
+                        match source {
+                            Some(source) => {
+                                app.settings
+                                    .borrow_mut()
+                                    .custom_file_icons
+                                    .insert(key.clone(), source);
+                            }
+                            None => {
+                                app.settings.borrow_mut().custom_file_icons.remove(&key);
+                            }
+                        }
+                        app.settings.borrow().save();
+                        app.refresh_after_icon_change();
+                        file_icon_rule_rows(&app, &parent, &container);
+                    }),
+                );
+            });
+        }
+        {
+            let weak = Rc::downgrade(app);
+            let key = key.clone();
+            let container = container.clone();
+            let parent = parent.clone();
+            remove.connect_clicked(move |_| {
+                let Some(app) = weak.upgrade() else { return };
+                app.settings.borrow_mut().custom_file_icons.remove(&key);
+                app.settings.borrow().save();
+                app.refresh_after_icon_change();
+                file_icon_rule_rows(&app, &parent, &container);
+            });
+        }
+    }
+}
+
+fn folder_icon_rule_rows(app: &Rc<App>, parent: &gtk::Window, container: &gtk::Box) {
+    clear_box(container);
+    let mut entries: Vec<(String, String, Option<String>)> = vec![
+        ("default".to_string(), "All folders".to_string(), None),
+    ];
+    for (name, hex) in crate::theme::FOLDER_PALETTE {
+        if let Some(key) = crate::theme::normalize_color(hex) {
+            entries.push((key.clone(), (*name).to_string(), Some(key)));
+        }
+    }
+    let meta_colors: Vec<String> = {
+        let meta = app.meta.borrow();
+        let mut colors: Vec<String> = meta
+            .items
+            .values()
+            .filter_map(|item| item.folder_color.as_deref())
+            .filter_map(crate::theme::normalize_color)
+            .collect();
+        colors.sort();
+        colors.dedup();
+        colors
+    };
+    for color in meta_colors {
+        if !entries.iter().any(|(key, _, _)| key == &color) {
+            entries.push((color.clone(), format!("Custom {color}"), Some(color)));
+        }
+    }
+    let extra: Vec<String> = app
+        .settings
+        .borrow()
+        .custom_folder_icons
+        .keys()
+        .filter(|key| *key != "default")
+        .cloned()
+        .collect();
+    for color in extra {
+        if !entries.iter().any(|(key, _, _)| key == &color) {
+            entries.push((color.clone(), format!("Colour {color}"), Some(color)));
+        }
+    }
+
+    let rules = app.settings.borrow().custom_folder_icons.clone();
+    for (key, label, swatch) in entries {
+        let source = rules.get(&key).cloned();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_top(3);
+        row.set_margin_bottom(3);
+        if let Some(color) = &swatch {
+            let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            dot.add_css_class("color-dot");
+            dot.add_css_class(&format!("swatch-{}", crate::theme::color_class(color)));
+            dot.set_size_request(12, 12);
+            dot.set_valign(gtk::Align::Center);
+            row.append(&dot);
+        }
+        let preview = icon_preview_slot();
+        update_icon_preview(&preview, source.as_deref(), 24);
+        row.append(&preview);
+        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        texts.set_hexpand(true);
+        let name = gtk::Label::new(Some(&label));
+        name.add_css_class("meta-value");
+        name.set_xalign(0.0);
+        texts.append(&name);
+        let detail = gtk::Label::new(Some(
+            source
+                .as_deref()
+                .map(crate::theme::icon_source_label)
+                .unwrap_or_else(|| "Theme default icon".to_string())
+                .as_str(),
+        ));
+        detail.add_css_class("tiny");
+        detail.add_css_class("dim");
+        detail.set_xalign(0.0);
+        detail.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        texts.append(&detail);
+        row.append(&texts);
+        let edit = gtk::Button::with_label(if source.is_some() { "Change…" } else { "Set icon…" });
+        row.append(&edit);
+        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove.add_css_class("flat");
+        remove.set_tooltip_text(Some("Clear this folder icon override"));
+        remove.set_sensitive(source.is_some());
+        row.append(&remove);
+        container.append(&row);
+
+        {
+            let weak = Rc::downgrade(app);
+            let key = key.clone();
+            let label = label.clone();
+            let initial = source.clone().unwrap_or_default();
+            let container = container.clone();
+            let parent = parent.clone();
+            edit.connect_clicked(move |_| {
+                let Some(app) = weak.upgrade() else { return };
+                let weak = Rc::downgrade(&app);
+                let key = key.clone();
+                let container = container.clone();
+                let parent = parent.clone();
+                let parent_for_dialog = parent.clone();
+                icon_source_dialog(
+                    &app,
+                    &parent_for_dialog,
+                    &format!("Folder icon — {label}"),
+                    &initial,
+                    Rc::new(move |source: Option<String>| {
+                        let Some(app) = weak.upgrade() else { return };
+                        match source {
+                            Some(source) => {
+                                app.settings
+                                    .borrow_mut()
+                                    .custom_folder_icons
+                                    .insert(key.clone(), source);
+                            }
+                            None => {
+                                app.settings.borrow_mut().custom_folder_icons.remove(&key);
+                            }
+                        }
+                        app.settings.borrow().save();
+                        app.refresh_after_icon_change();
+                        folder_icon_rule_rows(&app, &parent, &container);
+                    }),
+                );
+            });
+        }
+        {
+            let weak = Rc::downgrade(app);
+            let key = key.clone();
+            let container = container.clone();
+            let parent = parent.clone();
+            remove.connect_clicked(move |_| {
+                let Some(app) = weak.upgrade() else { return };
+                app.settings.borrow_mut().custom_folder_icons.remove(&key);
+                app.settings.borrow().save();
+                app.refresh_after_icon_change();
+                folder_icon_rule_rows(&app, &parent, &container);
+            });
+        }
+    }
+}
+
+fn icons_page(app: &Rc<App>, window: &gtk::Window) -> gtk::Widget {
     let (scroller, inner) = page_container(
-        "Icons",
-        "Icon theme selection is independent of the Delve CSS theme. Missing icons fall back automatically.",
+        "Icons & theme",
+        "Icon theme selection, per-type overrides and folder-colour icons. Changes apply live to every open view.",
     );
     let themes = crate::theme::detect_icon_themes();
     let mut labels = vec!["System default".to_string()];
@@ -2427,6 +3074,122 @@ fn icons_page(app: &Rc<App>) -> gtk::Widget {
             }
         },
     ));
+
+    inner.append(&section_label("CUSTOM FILE TYPE ICONS"));
+    let file_hint = gtk::Label::new(Some(
+        "Enter an extension (pdf), a MIME type (application/pdf), or a MIME wildcard (image/*). \
+         Custom icons replace thumbnails for overridden types.",
+    ));
+    file_hint.add_css_class("tiny");
+    file_hint.add_css_class("dim");
+    file_hint.set_xalign(0.0);
+    file_hint.set_wrap(true);
+    inner.append(&file_hint);
+    let file_add_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let file_key_entry = gtk::Entry::new();
+    file_key_entry.set_placeholder_text(Some("File type, e.g. pdf or image/*"));
+    file_key_entry.set_hexpand(true);
+    file_add_row.append(&file_key_entry);
+    let file_add = gtk::Button::with_label("Add rule…");
+    file_add_row.append(&file_add);
+    inner.append(&file_add_row);
+    let file_rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    file_icon_rule_rows(app, window, &file_rows);
+    inner.append(&file_rows);
+    {
+        let weak = Rc::downgrade(app);
+        let entry = file_key_entry.clone();
+        let rows = file_rows.clone();
+        let parent = window.clone();
+        file_add.connect_clicked(move |_| {
+            let key = entry.text().trim().to_ascii_lowercase();
+            if key.is_empty() {
+                if let Some(app) = weak.upgrade() {
+                    app.notify("Enter a file extension or MIME type first.", true);
+                }
+                return;
+            }
+            let Some(app) = weak.upgrade() else { return };
+            let initial = app
+                .settings
+                .borrow()
+                .custom_file_icons
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let weak = Rc::downgrade(&app);
+            let entry = entry.clone();
+            let key = key.clone();
+            let rows = rows.clone();
+            let parent = parent.clone();
+            let parent_for_dialog = parent.clone();
+            icon_source_dialog(
+                &app,
+                &parent_for_dialog,
+                &format!("Icon for {key}"),
+                &initial,
+                Rc::new(move |source: Option<String>| {
+                    let Some(app) = weak.upgrade() else { return };
+                    match source {
+                        Some(source) => {
+                            app.settings
+                                .borrow_mut()
+                                .custom_file_icons
+                                .insert(key.clone(), source);
+                        }
+                        None => {
+                            app.settings.borrow_mut().custom_file_icons.remove(&key);
+                        }
+                    }
+                    app.settings.borrow().save();
+                    app.refresh_after_icon_change();
+                    entry.set_text("");
+                    file_icon_rule_rows(&app, &parent, &rows);
+                }),
+            );
+        });
+    }
+
+    inner.append(&section_label("CUSTOM FOLDER ICONS"));
+    let folder_hint = gtk::Label::new(Some(
+        "Folder icons follow the colour assigned to the folder. “All folders” is the
+         fallback for folders without a colour-specific icon.",
+    ));
+    folder_hint.add_css_class("tiny");
+    folder_hint.add_css_class("dim");
+    folder_hint.set_xalign(0.0);
+    folder_hint.set_wrap(true);
+    inner.append(&folder_hint);
+    let folder_rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    folder_icon_rule_rows(app, window, &folder_rows);
+    inner.append(&folder_rows);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let open_icons = gtk::Button::with_label("Open icons folder");
+    {
+        let weak = Rc::downgrade(app);
+        open_icons.connect_clicked(move |_| {
+            if weak.upgrade().is_some() {
+                let _ = std::fs::create_dir_all(crate::paths::icons_dir());
+                let file = gio::File::for_path(crate::paths::icons_dir());
+                let _ = gio::AppInfo::launch_default_for_uri(
+                    &file.uri(),
+                    None::<&gio::AppLaunchContext>,
+                );
+            }
+        });
+    }
+    actions.append(&open_icons);
+    inner.append(&actions);
+    let location = gtk::Label::new(Some(&format!(
+        "Uploaded icons are stored in {}",
+        crate::paths::icons_dir().display()
+    )));
+    location.add_css_class("tiny");
+    location.add_css_class("dim");
+    location.set_xalign(0.0);
+    location.set_wrap(true);
+    inner.append(&location);
     scroller.upcast()
 }
 
@@ -2565,7 +3328,7 @@ fn files_page(app: &Rc<App>) -> gtk::Widget {
             let weak = Rc::downgrade(app);
             move |index| {
                 if let Some(app) = weak.upgrade() {
-                    app.settings.borrow_mut().default_sort = SortField::all()[index.min(7)];
+                    app.settings.borrow_mut().default_sort = SortField::all()[index.min(3)];
                     save(&app);
                 }
             }
@@ -2833,10 +3596,231 @@ fn terminal_page(app: &Rc<App>, _window: &gtk::Window) -> gtk::Widget {
     scroller.upcast()
 }
 
+fn parse_env_text(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut env = BTreeMap::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("Environment line {} must be KEY=value.", index + 1));
+        };
+        let key = key.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) || key.contains('=') {
+            return Err(format!("Invalid environment variable name on line {}.", index + 1));
+        }
+        env.insert(key.to_string(), value.trim().to_string());
+    }
+    Ok(env)
+}
+
+/// Choose one or more command sets for the current folder. The selected sets
+/// start together; each one still follows its own sequential/parallel/mixed
+/// scheduling internally.
+pub fn run_commands_picker(app: &Rc<App>, folder: PathBuf, selected: Vec<PathBuf>) {
+    let window = dialog_window(app, "Run command sets", 620, 560);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 9);
+    root.set_margin_top(16);
+    root.set_margin_bottom(14);
+    root.set_margin_start(16);
+    root.set_margin_end(16);
+    root.append(&header(
+        "Run command sets",
+        &format!(
+            "{}
+Choose one or more sets. Selected sets start together in the detached run window.",
+            folder.display()
+        ),
+    ));
+
+    let available: Vec<RunCommand> = app
+        .settings
+        .borrow()
+        .commands
+        .iter()
+        .filter(|command| command.enabled && command.applies_to(&folder))
+        .cloned()
+        .collect();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let checks: Rc<RefCell<Vec<(RunCommand, gtk::CheckButton)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    if available.is_empty() {
+        let empty = gtk::Label::new(Some(
+            "No enabled command sets apply to this folder. Create one, or check its availability.",
+        ));
+        empty.set_xalign(0.0);
+        empty.set_wrap(true);
+        empty.add_css_class("hint");
+        list.append(&empty);
+    }
+    for command in available {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        let check = gtk::CheckButton::new();
+        check.set_valign(gtk::Align::Start);
+        row.append(&check);
+        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        texts.set_hexpand(true);
+        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+        let title = gtk::Label::new(Some(&command.name));
+        title.add_css_class("meta-value");
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title_row.append(&title);
+        if let Some(shortcut) = command.shortcut_label() {
+            let hint = gtk::Label::new(Some(&shortcut));
+            hint.add_css_class("tiny");
+            hint.add_css_class("dim");
+            title_row.append(&hint);
+        }
+        texts.append(&title_row);
+        let steps = command.effective_steps();
+        let detail = gtk::Label::new(Some(&format!(
+            "{} command{} · {} · {}{}",
+            steps.len(),
+            if steps.len() == 1 { "" } else { "s" },
+            command.mode.label(),
+            command.launch.label(),
+            if command.description.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", command.description.trim())
+            }
+        )));
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        detail.add_css_class("tiny");
+        detail.add_css_class("dim");
+        texts.append(&detail);
+        row.append(&texts);
+        list.append(&row);
+        checks.borrow_mut().push((command, check));
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .vexpand(true)
+        .min_content_height(180)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    root.append(&scroller);
+
+    let selection_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let select_all = gtk::Button::with_label("Select all");
+    select_all.add_css_class("flat");
+    let select_none = gtk::Button::with_label("Select none");
+    select_none.add_css_class("flat");
+    selection_buttons.append(&select_all);
+    selection_buttons.append(&select_none);
+    root.append(&selection_buttons);
+    {
+        let checks = checks.clone();
+        select_all.connect_clicked(move |_| {
+            for (_, check) in checks.borrow().iter() {
+                check.set_active(true);
+            }
+        });
+    }
+    {
+        let checks = checks.clone();
+        select_none.connect_clicked(move |_| {
+            for (_, check) in checks.borrow().iter() {
+                check.set_active(false);
+            }
+        });
+    }
+    {
+        let checks = checks.clone();
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            if keyval == gtk4::gdk::Key::a
+                && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            {
+                for (_, check) in checks.borrow().iter() {
+                    check.set_active(true);
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(key);
+    }
+
+    let error = gtk::Label::new(None);
+    error.add_css_class("danger");
+    error.add_css_class("tiny");
+    error.set_xalign(0.0);
+    error.set_visible(false);
+    root.append(&error);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let manage = gtk::Button::with_label("Manage command sets…");
+    manage.add_css_class("flat");
+    buttons.append(&manage);
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    buttons.append(&spacer);
+    let cancel = gtk::Button::with_label("Cancel");
+    buttons.append(&cancel);
+    let run = gtk::Button::with_label("Run selected");
+    run.add_css_class("suggested");
+    buttons.append(&run);
+    root.append(&buttons);
+    window.set_child(Some(&root));
+
+    {
+        let window = window.clone();
+        cancel.connect_clicked(move |_| window.close());
+    }
+    {
+        let weak = Rc::downgrade(app);
+        let window = window.clone();
+        manage.connect_clicked(move |_| {
+            window.close();
+            if let Some(app) = weak.upgrade() {
+                app.open_settings(Some("commands"));
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(app);
+        let window = window.clone();
+        let checks = checks.clone();
+        let error = error.clone();
+        let folder = folder.clone();
+        let selected = selected.clone();
+        run.connect_clicked(move |_| {
+            let Some(app) = weak.upgrade() else { return };
+            let profiles: Vec<RunCommand> = checks
+                .borrow()
+                .iter()
+                .filter(|(_, check)| check.is_active())
+                .map(|(command, _)| command.clone())
+                .collect();
+            if profiles.is_empty() {
+                error.set_text("Select at least one command set to run.");
+                error.set_visible(true);
+                return;
+            }
+            window.close();
+            crate::runner::start_many(
+                &app,
+                profiles,
+                folder.clone(),
+                selected.clone(),
+            );
+        });
+    }
+    run.grab_focus();
+    window.present();
+}
+
 fn commands_page(app: &Rc<App>) -> gtk::Widget {
     let (scroller, inner) = page_container(
-        "Commands",
-        "Folder run commands are explicit, user-configured and never triggered by navigation.",
+        "Command sets",
+        "Each set can hold several commands and apply to a folder, its subtree, or every folder. Assign Shift+S slots to run sets instantly.",
     );
     let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let commands = app.settings.borrow().commands.clone();
@@ -2854,11 +3838,24 @@ fn commands_page(app: &Rc<App>) -> gtk::Widget {
         title.set_xalign(0.0);
         title.add_css_class("meta-value");
         texts.append(&title);
+        let steps = command.effective_steps();
         let detail = gtk::Label::new(Some(&format!(
-            "{} {}{}",
-            command.program,
-            command.args.join(" "),
-            if command.enabled { "" } else { " · disabled" }
+            "{} command{} · {} · {}{}{}{} · {}",
+            steps.len(),
+            if steps.len() == 1 { "" } else { "s" },
+            command.mode.label(),
+            command.scope.label(),
+            if command.launch == LaunchMode::Background { "" } else { " · terminal" },
+            if command.enabled { "" } else { " · disabled" },
+            command
+                .shortcut_label()
+                .map(|shortcut| format!(" · {shortcut}"))
+                .unwrap_or_default(),
+            command
+                .folder
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "any folder".into())
         )));
         detail.set_xalign(0.0);
         detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -2866,6 +3863,23 @@ fn commands_page(app: &Rc<App>) -> gtk::Widget {
         detail.add_css_class("dim");
         texts.append(&detail);
         row_box.append(&texts);
+        let run = gtk::Button::with_label("Run");
+        run.add_css_class("flat");
+        {
+            let weak = Rc::downgrade(app);
+            let command = command.clone();
+            run.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    let folder = command
+                        .folder
+                        .clone()
+                        .or_else(|| app.active_location().path().cloned())
+                        .unwrap_or_else(crate::paths::home);
+                    crate::runner::confirm_and_start(&app, command.clone(), folder, Vec::new());
+                }
+            });
+        }
+        row_box.append(&run);
         let edit = gtk::Button::with_label("Edit");
         edit.add_css_class("flat");
         {
@@ -2920,7 +3934,7 @@ fn commands_page(app: &Rc<App>) -> gtk::Widget {
                             settings.commands.retain(|c| c.id != id);
                             settings.save();
                         }
-                        app_c.notify("Command deleted", false);
+                        app_c.notify("Command set deleted", false);
                     },
                 );
             });
@@ -2929,7 +3943,7 @@ fn commands_page(app: &Rc<App>) -> gtk::Widget {
         list.append(&row_box);
     }
     inner.append(&list);
-    let add = gtk::Button::with_label("Add command…");
+    let add = gtk::Button::with_label("Add command set…");
     add.add_css_class("suggested");
     {
         let weak = Rc::downgrade(app);
@@ -2940,6 +3954,14 @@ fn commands_page(app: &Rc<App>) -> gtk::Widget {
         });
     }
     inner.append(&add);
+    let shortcuts = gtk::Label::new(Some(
+        "Quick launch: Shift+S, 1–9 runs the assigned set; Shift+S, 0 opens the multi-set picker.",
+    ));
+    shortcuts.add_css_class("tiny");
+    shortcuts.add_css_class("dim");
+    shortcuts.set_xalign(0.0);
+    shortcuts.set_wrap(true);
+    inner.append(&shortcuts);
     scroller.upcast()
 }
 
@@ -3210,7 +4232,8 @@ fn advanced_page(app: &Rc<App>, _window: &gtk::Window) -> gtk::Widget {
         diagnostics.connect_clicked(move |_| {
             if let Some(app) = weak.upgrade() {
                 let text = format!(
-                    "Delve 1.0.0\nGTK: {}.{}.{}\nConfig: {}\nData: {}\nCache: {}\nTheme: {}\nTabs open: {}\nThumbnails: {}",
+                    "Delve {}\nGTK: {}.{}.{}\nConfig: {}\nData: {}\nCache: {}\nTheme: {}\nTabs open: {}\nThumbnails: {}",
+                    env!("CARGO_PKG_VERSION"),
                     gtk::major_version(),
                     gtk::minor_version(),
                     gtk::micro_version(),
@@ -3281,6 +4304,8 @@ fn advanced_page(app: &Rc<App>, _window: &gtk::Window) -> gtk::Widget {
                             app.apply_shortcuts();
                             app.reload_theme();
                             app.apply_density();
+                            app.apply_window_opacity();
+                            app.refresh_after_icon_change();
                             app.refresh_sidebar();
                             app.refresh_after_metadata_change();
                             app.notify("Configuration imported", false);
@@ -3313,6 +4338,8 @@ fn advanced_page(app: &Rc<App>, _window: &gtk::Window) -> gtk::Widget {
                     app_c.apply_shortcuts();
                     app_c.reload_theme();
                     app_c.apply_density();
+                    app_c.apply_window_opacity();
+                    app_c.refresh_after_icon_change();
                     app_c.refresh_sidebar();
                     app_c.notify("Settings reset", false);
                 },
@@ -3323,13 +4350,69 @@ fn advanced_page(app: &Rc<App>, _window: &gtk::Window) -> gtk::Widget {
     scroller.upcast()
 }
 
+struct StepRowUi {
+    row: gtk::Box,
+    group: gtk::SpinButton,
+    program: gtk::Entry,
+    args: gtk::Entry,
+}
+
+fn add_step_row(
+    steps_box: &gtk::Box,
+    rows: &Rc<RefCell<Vec<StepRowUi>>>,
+    program_text: &str,
+    args_text: &str,
+    group: u32,
+) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let group_label = gtk::Label::new(Some("G"));
+    group_label.add_css_class("tiny");
+    group_label.add_css_class("dim");
+    row.append(&group_label);
+    let group_spin = gtk::SpinButton::with_range(0.0, 99.0, 1.0);
+    group_spin.set_width_chars(2);
+    group_spin.set_value(group as f64);
+    group_spin.set_tooltip_text(Some("Group number (used in mixed mode)"));
+    row.append(&group_spin);
+    let program = gtk::Entry::new();
+    program.set_placeholder_text(Some("Program"));
+    program.set_text(program_text);
+    program.set_width_chars(14);
+    row.append(&program);
+    let args = gtk::Entry::new();
+    args.set_placeholder_text(Some("Arguments; {folder} {selected} {name} {home}"));
+    args.set_text(args_text);
+    args.set_hexpand(true);
+    row.append(&args);
+    let remove = gtk::Button::from_icon_name("list-remove-symbolic");
+    remove.add_css_class("flat");
+    remove.set_tooltip_text(Some("Remove this command"));
+    {
+        let steps_box = steps_box.clone();
+        let rows = rows.clone();
+        let row_ref = row.clone();
+        remove.connect_clicked(move |_| {
+            steps_box.remove(&row_ref);
+            rows.borrow_mut().retain(|r| r.row.parent().is_some());
+        });
+    }
+    row.append(&remove);
+    rows.borrow_mut().push(StepRowUi {
+        row: row.clone(),
+        group: group_spin,
+        program,
+        args,
+    });
+    steps_box.append(&row);
+}
+
 pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
     let editing = existing.clone();
     let window = dialog_window(
         app,
-        if existing.is_some() { "Edit command" } else { "Add command" },
-        520,
-        480,
+        if existing.is_some() { "Edit command profile" } else { "New command profile" },
+        660,
+        800,
     );
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.set_margin_top(14);
@@ -3337,26 +4420,45 @@ pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
     root.set_margin_start(14);
     root.set_margin_end(14);
     root.append(&header(
-        "Folder run command",
-        "Commands run only when you choose them, and ask for confirmation first.",
+        "Run command profile",
+        "Commands run only when chosen. They are spawned as argv, never through a shell.",
     ));
     let name = gtk::Entry::new();
-    name.set_placeholder_text(Some("Name shown in the menu"));
-    let program = gtk::Entry::new();
-    program.set_placeholder_text(Some("Program, e.g. code"));
-    let args = gtk::Entry::new();
-    args.set_placeholder_text(Some("Arguments; {folder} {selected} {name} {home}"));
+    name.set_placeholder_text(Some("Name shown in the menu and Spotlight"));
     let description = gtk::Entry::new();
     description.set_placeholder_text(Some("Optional description"));
     let folder = gtk::Entry::new();
-    folder.set_placeholder_text(Some("Optional: only show this command in one folder"));
+    folder.set_placeholder_text(Some("Folder this profile belongs to"));
+    let scope_drop = gtk::DropDown::from_strings(&RunScope::all().map(|s| s.label()));
+    let env_view = gtk::TextView::new();
+    env_view.set_monospace(true);
+    env_view.set_wrap_mode(gtk::WrapMode::WordChar);
+    env_view.set_top_margin(4);
+    env_view.set_bottom_margin(4);
+    env_view.set_left_margin(6);
+    env_view.set_right_margin(6);
     let cwd_drop = gtk::DropDown::from_strings(&CwdRule::all().map(|c| c.label()));
     let enabled = gtk::Switch::new();
     enabled.set_active(true);
+    let mode_drop = gtk::DropDown::from_strings(&RunMode::all().map(|m| m.label()));
+    let launch_drop = gtk::DropDown::from_strings(&LaunchMode::all().map(|m| m.label()));
+    let stop_on_failure = gtk::Switch::new();
+    stop_on_failure.set_active(true);
+    let shortcut_drop = gtk::DropDown::from_strings(&[
+        "No shortcut",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+    ]);
+
     if let Some(cmd) = &existing {
         name.set_text(&cmd.name);
-        program.set_text(&cmd.program);
-        args.set_text(&cmd.args.join(" "));
         description.set_text(&cmd.description);
         folder.set_text(
             &cmd.folder
@@ -3364,6 +4466,19 @@ pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
         );
+        scope_drop.set_selected(
+            RunScope::all()
+                .iter()
+                .position(|s| *s == cmd.scope)
+                .unwrap_or(1) as u32,
+        );
+        let env_text = cmd
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        env_view.buffer().set_text(&env_text);
         cwd_drop.set_selected(
             CwdRule::all()
                 .iter()
@@ -3371,14 +4486,130 @@ pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
                 .unwrap_or(0) as u32,
         );
         enabled.set_active(cmd.enabled);
+        mode_drop.set_selected(
+            RunMode::all()
+                .iter()
+                .position(|m| *m == cmd.mode)
+                .unwrap_or(0) as u32,
+        );
+        launch_drop.set_selected(
+            LaunchMode::all()
+                .iter()
+                .position(|m| *m == cmd.launch)
+                .unwrap_or(0) as u32,
+        );
+        stop_on_failure.set_active(cmd.stop_on_failure);
+        shortcut_drop.set_selected(cmd.shortcut.min(9) as u32);
+    } else {
+        // Match the original context-menu behaviour: a new profile applies to
+        // the active folder and its subfolders until the user narrows it.
+        scope_drop.set_selected(1);
+        if let Some(path) = app.active_location().path() {
+            folder.set_text(&path.display().to_string());
+        }
     }
+
     root.append(&row("Name", "Required.", &name));
-    root.append(&row("Program", "Found on PATH, or an absolute path.", &program));
-    root.append(&row("Arguments", "Placeholders expand without a shell.", &args));
-    root.append(&row("Working directory", "", &cwd_drop));
     root.append(&row("Description", "", &description));
-    root.append(&row("Limit to folder", "Leave empty for all folders.", &folder));
+    root.append(&row(
+        "Folder",
+        "Base folder. Required unless availability is “Every folder”.",
+        &folder,
+    ));
+    root.append(&row(
+        "Availability",
+        "Choose whether the profile is offered in this folder, its subtree, or everywhere.",
+        &scope_drop,
+    ));
+    root.append(&row("Working directory", "", &cwd_drop));
+    root.append(&row("Execution mode", "Sequential, all at once, or ordered groups.", &mode_drop));
+    let mode_hint = gtk::Label::new(Some(RunMode::Sequential.hint()));
+    mode_hint.add_css_class("tiny");
+    mode_hint.add_css_class("dim");
+    mode_hint.set_xalign(0.0);
+    root.append(&mode_hint);
+    root.append(&row("Launch in", "Background processes appear in the run panel.", &launch_drop));
+    root.append(&row("Stop on failure", "Skip later steps/groups when one fails.", &stop_on_failure));
     root.append(&row("Enabled", "", &enabled));
+    root.append(&row(
+        "Quick shortcut",
+        "Press Shift+S, then this number from the main window. Slots are unique.",
+        &shortcut_drop,
+    ));
+
+    let env_title = gtk::Label::new(Some("ENVIRONMENT"));
+    env_title.add_css_class("section-title");
+    env_title.set_xalign(0.0);
+    root.append(&env_title);
+    let env_hint = gtk::Label::new(Some(
+        "Optional KEY=value lines, one per line. Blank lines and lines starting with # are ignored.",
+    ));
+    env_hint.add_css_class("tiny");
+    env_hint.add_css_class("dim");
+    env_hint.set_xalign(0.0);
+    env_hint.set_wrap(true);
+    root.append(&env_hint);
+    let env_scroll = gtk::ScrolledWindow::builder()
+        .child(&env_view)
+        .min_content_height(64)
+        .max_content_height(110)
+        .propagate_natural_height(true)
+        .build();
+    root.append(&env_scroll);
+
+    let steps_title = gtk::Label::new(Some("COMMANDS"));
+    steps_title.add_css_class("section-title");
+    steps_title.set_xalign(0.0);
+    root.append(&steps_title);
+    let steps_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let steps_scroll = gtk::ScrolledWindow::builder()
+        .child(&steps_box)
+        .min_content_height(80)
+        .max_content_height(210)
+        .propagate_natural_height(true)
+        .build();
+    root.append(&steps_scroll);
+    let rows: Rc<RefCell<Vec<StepRowUi>>> = Rc::new(RefCell::new(Vec::new()));
+    if let Some(cmd) = &existing {
+        for step in cmd.effective_steps() {
+            add_step_row(
+                &steps_box,
+                &rows,
+                &step.program,
+                &step.args.join(" "),
+                step.group,
+            );
+        }
+    }
+    if rows.borrow().is_empty() {
+        add_step_row(&steps_box, &rows, "", "", 0);
+    }
+    {
+        let steps_box = steps_box.clone();
+        let rows = rows.clone();
+        let add = gtk::Button::with_label("Add command");
+        add.add_css_class("flat");
+        add.connect_clicked(move |_| {
+            add_step_row(&steps_box, &rows, "", "", 0);
+        });
+        root.append(&add);
+    }
+    {
+        let hint = mode_hint.clone();
+        mode_drop.connect_selected_notify(move |drop| {
+            let mode = RunMode::all()[drop.selected().min(2) as usize];
+            hint.set_text(mode.hint());
+        });
+    }
+    {
+        let folder = folder.clone();
+        let apply_sensitivity = move |drop: &gtk::DropDown| {
+            folder.set_sensitive(drop.selected() != 2);
+        };
+        apply_sensitivity(&scope_drop);
+        scope_drop.connect_selected_notify(apply_sensitivity);
+    }
+
     let error = gtk::Label::new(None);
     error.add_css_class("danger");
     error.add_css_class("tiny");
@@ -3389,7 +4620,7 @@ pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
     buttons.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
     buttons.append(&cancel);
-    let save_btn = gtk::Button::with_label("Save command");
+    let save_btn = gtk::Button::with_label("Save profile");
     save_btn.add_css_class("suggested");
     buttons.append(&save_btn);
     root.append(&buttons);
@@ -3398,38 +4629,97 @@ pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
         let window = window.clone();
         cancel.connect_clicked(move |_| window.close());
     }
+    let name_focus = name.clone();
     {
         let weak = Rc::downgrade(app);
         let window_ref = window.clone();
         let editing = editing.clone();
+        let rows = rows.clone();
         save_btn.connect_clicked(move |_| {
             let Some(app) = weak.upgrade() else { return };
-            if name.text().trim().is_empty() || program.text().trim().is_empty() {
-                error.set_text("A name and program are required.");
+            let steps: Vec<RunStep> = rows
+                .borrow()
+                .iter()
+                .filter_map(|row| {
+                    let program = row.program.text().trim().to_string();
+                    if program.is_empty() {
+                        return None;
+                    }
+                    Some(RunStep {
+                        program,
+                        args: crate::terminal::split_args(&row.args.text()),
+                        group: row.group.value() as u32,
+                    })
+                })
+                .collect();
+            if name.text().trim().is_empty() || steps.is_empty() {
+                error.set_text("A name and at least one program are required.");
                 error.set_visible(true);
                 return;
             }
+            let scope = RunScope::all()[scope_drop.selected().min(2) as usize];
             let folder_path = {
                 let text = folder.text().to_string();
-                if text.trim().is_empty() {
+                if scope == RunScope::Global || text.trim().is_empty() {
                     None
                 } else {
                     Some(PathBuf::from(text.trim()))
                 }
             };
-            let command = RunCommand {
-                id: editing
-                    .as_ref()
-                    .map(|c| c.id.clone())
-                    .unwrap_or_else(|| format!("cmd-{}", crate::util::now_millis())),
+            if scope != RunScope::Global && folder_path.is_none() {
+                error.set_text("Choose a folder for folder-scoped profiles, or select “Every folder”.");
+                error.set_visible(true);
+                return;
+            }
+            let buffer = env_view.buffer();
+            let env_text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+            let environment = match parse_env_text(&env_text) {
+                Ok(environment) => environment,
+                Err(message) => {
+                    error.set_text(&message);
+                    error.set_visible(true);
+                    return;
+                }
+            };
+            let shortcut = shortcut_drop.selected().min(9) as u8;
+            let id = editing
+                .as_ref()
+                .map(|c| c.id.clone())
+                .unwrap_or_else(|| format!("cmd-{}", crate::util::now_millis()));
+            if shortcut > 0 {
+                let settings = app.settings.borrow();
+                if let Some(other) = settings
+                    .commands
+                    .iter()
+                    .find(|c| c.id != id && c.shortcut == shortcut)
+                {
+                    let name = other.name.clone();
+                    drop(settings);
+                    error.set_text(&format!(
+                        "Shift+S, {shortcut} is already assigned to “{name}”."
+                    ));
+                    error.set_visible(true);
+                    return;
+                }
+            }
+            let mut command = RunCommand {
+                id,
                 name: name.text().to_string(),
-                program: program.text().to_string(),
-                args: crate::terminal::split_args(&args.text()),
+                program: String::new(),
+                args: Vec::new(),
                 cwd_rule: CwdRule::all()[cwd_drop.selected().min(2) as usize],
                 description: description.text().to_string(),
                 enabled: enabled.state(),
                 folder: folder_path,
+                scope,
+                env: environment,
+                shortcut,
+                steps,
+                mode: RunMode::all()[mode_drop.selected().min(2) as usize],
+                launch: LaunchMode::all()[launch_drop.selected().min(1) as usize],
+                stop_on_failure: stop_on_failure.state(),
             };
+            command.sync_legacy();
             {
                 let mut settings = app.settings.borrow_mut();
                 if let Some(existing) = &editing {
@@ -3444,9 +4734,10 @@ pub fn run_command_editor(app: &Rc<App>, existing: Option<RunCommand>) {
                 settings.save();
             }
             window_ref.close();
-            app.notify("Command saved", false);
+            app.notify("Command profile saved", false);
         });
     }
+    name_focus.grab_focus();
     window.present();
 }
 

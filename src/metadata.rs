@@ -17,7 +17,27 @@ pub struct Tag {
     pub id: String,
     pub name: String,
     pub color: String,
+    /// Symbolic icon name. Defaults make old databases load unchanged.
+    #[serde(default = "default_tag_icon")]
+    pub icon: String,
 }
+
+fn default_tag_icon() -> String {
+    "tag-symbolic".into()
+}
+
+/// Icons offered when creating or customising a tag. All are part of the
+/// standard symbolic icon set so they follow Delve's theme colours.
+pub const TAG_ICONS: &[(&str, &str)] = &[
+    ("tag-symbolic", "Tag"),
+    ("starred-symbolic", "Star"),
+    ("emblem-important-symbolic", "Important"),
+    ("folder-symbolic", "Folder"),
+    ("document-symbolic", "Document"),
+    ("folder-documents-symbolic", "Documents"),
+    ("user-home-symbolic", "Home"),
+    ("network-workgroup-symbolic", "Work"),
+];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ItemMeta {
@@ -42,6 +62,12 @@ pub struct Metadata {
 impl Default for Metadata {
     fn default() -> Self {
         let palette = ["#5b9dff", "#43c98a", "#f2b134", "#e2679b", "#a78bfa", "#38bdf8"];
+        let icons = [
+            "network-workgroup-symbolic",
+            "user-home-symbolic",
+            "folder-symbolic",
+            "emblem-important-symbolic",
+        ];
         let tags = ["Work", "Personal", "Archive", "Important"]
             .iter()
             .enumerate()
@@ -49,6 +75,7 @@ impl Default for Metadata {
                 id: format!("tag{}", i + 1),
                 name: (*name).to_string(),
                 color: palette[i % palette.len()].to_string(),
+                icon: icons[i % icons.len()].to_string(),
             })
             .collect();
         Metadata { version: META_VERSION, tags, items: HashMap::new() }
@@ -96,7 +123,7 @@ impl Metadata {
         self.tags.iter().find(|t| t.name.eq_ignore_ascii_case(name))
     }
 
-    pub fn create_tag(&mut self, name: &str, color: &str) -> Result<String, String> {
+    pub fn create_tag_with_icon(&mut self, name: &str, color: &str, icon: &str) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("Tag name cannot be empty.".into());
@@ -109,9 +136,17 @@ impl Metadata {
             id: id.clone(),
             name: name.to_string(),
             color: color.to_string(),
+            icon: if icon.trim().is_empty() { "tag-symbolic" } else { icon }.to_string(),
         });
         self.save();
         Ok(id)
+    }
+
+    pub fn set_tag_icon(&mut self, id: &str, icon: &str) {
+        if let Some(tag) = self.tags.iter_mut().find(|t| t.id == id) {
+            tag.icon = if icon.trim().is_empty() { "tag-symbolic" } else { icon }.to_string();
+            self.save();
+        }
     }
 
     pub fn rename_tag(&mut self, id: &str, name: &str) -> Result<(), String> {

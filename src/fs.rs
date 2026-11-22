@@ -372,17 +372,10 @@ impl SortField {
         }
     }
 
-    pub fn all() -> [SortField; 8] {
-        [
-            SortField::Name,
-            SortField::Type,
-            SortField::Size,
-            SortField::Modified,
-            SortField::Created,
-            SortField::Permissions,
-            SortField::Owner,
-            SortField::Tags,
-        ]
+    /// Fields offered in sorting UI. The remaining variants still exist for
+    /// detail columns and saved state, but are not selectable sort keys.
+    pub fn all() -> [SortField; 4] {
+        [SortField::Name, SortField::Type, SortField::Size, SortField::Modified]
     }
 }
 
