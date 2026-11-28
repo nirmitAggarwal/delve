@@ -87,6 +87,20 @@ install -m 0644 assets/icons/README.md "$STAGE/assets/icons/"
 install -m 0644 assets/icons/COPYING.ADWAITA "$STAGE/assets/icons/"
 cp -a assets/icons/hicolor "$STAGE/share/icons/"
 cp -a assets/icons/Delve "$STAGE/share/icons/"
+
+# Raster app icons are committed for platforms that do not render SVG. Rebuild
+# them from assets/delve.svg in the staging tree so a release can never ship an
+# older logo than the SVG it was built from.
+if command -v rsvg-convert >/dev/null 2>&1; then
+  for size in 16 24 32 48 64 128 256 512; do
+    dir="$STAGE/share/icons/hicolor/${size}x${size}/apps"
+    mkdir -p "$dir"
+    rsvg-convert -w "$size" -h "$size" assets/delve.svg -o "$dir/$APP_ID.png"
+  done
+  echo "==> Refreshed raster application icons from assets/delve.svg"
+else
+  echo "Warning: rsvg-convert not found; packaged PNG icons may be stale." >&2
+fi
 cp -a docs/. "$STAGE/docs/"
 
 echo "==> Creating $TARBALL"

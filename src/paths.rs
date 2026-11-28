@@ -202,6 +202,49 @@ pub fn mounts() -> Vec<(String, PathBuf)> {
     out
 }
 
+/// Space usage for the filesystem holding `path`, in bytes.
+///
+/// `statvfs` reports block counts, which is what the kernel and `df` use, so
+/// the dashboard agrees with the rest of the system.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub total: u64,
+    pub free: u64,
+}
+
+impl DiskSpace {
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.free)
+    }
+
+    pub fn percent_used(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.used() as f64 / self.total as f64) * 100.0
+        }
+    }
+}
+
+pub fn disk_space(path: &Path) -> Option<DiskSpace> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` only writes into the provided struct, which is fully
+    // initialised by the call on success.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        let block = stat.f_frsize.max(1) as u64;
+        let total = (stat.f_blocks as u64).saturating_mul(block);
+        // `f_bavail` is what unprivileged users can actually write, so it is
+        // the number that matches the user's expectations of free space.
+        let free = (stat.f_bavail as u64).saturating_mul(block);
+        Some(DiskSpace { total, free })
+    }
+}
+
 /// Remote/network mounts detected in mountinfo, without pretending any
 /// unsupported protocol works.
 pub fn network_mounts() -> Vec<(String, PathBuf)> {

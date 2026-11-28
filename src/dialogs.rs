@@ -17,9 +17,17 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 fn dialog_window(app: &Rc<App>, title: &str, width: i32, height: i32) -> gtk::Window {
+    dialog_window_for(app.window.upcast_ref(), title, width, height)
+}
+
+/// Dialog that is transient for a specific window. Dialogs opened from another
+/// modal dialog must use that dialog as their parent; otherwise the window
+/// manager can stack them behind the modal they belong to and they appear
+/// unresponsive.
+fn dialog_window_for(parent: &gtk::Window, title: &str, width: i32, height: i32) -> gtk::Window {
     let window = gtk::Window::builder()
         .title(title)
-        .transient_for(&app.window)
+        .transient_for(parent)
         .modal(true)
         .default_width(width)
         .default_height(height)
@@ -99,7 +107,22 @@ pub fn confirm<F>(
 ) where
     F: Fn(&Rc<App>) + 'static,
 {
-    let window = dialog_window(app, title, 430, 200);
+    confirm_for(app.window.upcast_ref(), app, title, detail, confirm_label, destructive, on_confirm);
+}
+
+/// Confirmation dialog owned by a specific parent window, for nested dialogs.
+pub fn confirm_for<F>(
+    parent: &gtk::Window,
+    app: &Rc<App>,
+    title: &str,
+    detail: &str,
+    confirm_label: &str,
+    destructive: bool,
+    on_confirm: F,
+) where
+    F: Fn(&Rc<App>) + 'static,
+{
+    let window = dialog_window_for(parent, title, 430, 200);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.set_margin_top(16);
     root.set_margin_bottom(14);
@@ -1550,7 +1573,6 @@ pub fn assign_tags_dialog(app: &Rc<App>, paths: Vec<PathBuf>) {
     let build = {
         let weak = Rc::downgrade(app);
         let list = list.clone();
-        let refresh = refresh.clone();
         let paths = paths.clone();
         move || {
             let Some(app) = weak.upgrade() else { return };
@@ -1635,23 +1657,24 @@ pub fn assign_tags_dialog(app: &Rc<App>, paths: Vec<PathBuf>) {
     {
         let weak = Rc::downgrade(app);
         let build = build.clone();
+        let assign_window = window.clone();
         new_tag.connect_clicked(move |_| {
-            if let Some(app) = weak.upgrade() {
-                create_tag_dialog(&app);
-                let build = build.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || build());
-            }
+            let Some(app) = weak.upgrade() else { return };
+            let created = create_tag_dialog_for(&app, &assign_window);
+            let build = build.clone();
+            created.connect_destroy(move |_| build());
         });
     }
     {
         let weak = Rc::downgrade(app);
         let build = build.clone();
+        let assign_window = window.clone();
         manage.connect_clicked(move |_| {
-            if let Some(app) = weak.upgrade() {
-                tag_manager(&app);
-                let build = build.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || build());
-            }
+            let Some(app) = weak.upgrade() else { return };
+            let manager = tag_manager_for(&app, &assign_window);
+            let build = build.clone();
+            // Tag changes made in the manager are reflected once it closes.
+            manager.connect_destroy(move |_| build());
         });
     }
     window.present();
@@ -1778,8 +1801,14 @@ pub fn folder_color_dialog(app: &Rc<App>, paths: Vec<PathBuf>) {
     window.present();
 }
 
-pub fn create_tag_dialog(app: &Rc<App>) {
-    let window = dialog_window(app, "New tag", 400, 300);
+pub fn create_tag_dialog(app: &Rc<App>) -> gtk::Window {
+    create_tag_dialog_for(app, app.window.upcast_ref())
+}
+
+/// Create-tag dialog owned by the window that opened it, so it stacks above a
+/// modal tag manager instead of behind it.
+fn create_tag_dialog_for(app: &Rc<App>, parent: &gtk::Window) -> gtk::Window {
+    let window = dialog_window_for(parent, "New tag", 400, 300);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.set_margin_top(14);
     root.set_margin_bottom(12);
@@ -1874,10 +1903,15 @@ pub fn create_tag_dialog(app: &Rc<App>) {
     }
     name.grab_focus();
     window.present();
+    window
 }
 
 pub fn tag_manager(app: &Rc<App>) {
-    let window = dialog_window(app, "Tags", 520, 560);
+    tag_manager_for(app, app.window.upcast_ref());
+}
+
+fn tag_manager_for(app: &Rc<App>, parent: &gtk::Window) -> gtk::Window {
+    let window = dialog_window_for(parent, "Tags", 540, 560);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.set_margin_top(14);
     root.set_margin_bottom(12);
@@ -1894,10 +1928,24 @@ pub fn tag_manager(app: &Rc<App>) {
         .build();
     root.append(&scroller);
     let refresh: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    // Mutations are triggered by buttons inside the rows being rebuilt, so a
+    // synchronous rebuild would destroy the widget while it is still emitting
+    // its click signal. Rebuild on an idle callback instead.
+    let rebuild_later: Rc<dyn Fn()> = {
+        let refresh = refresh.clone();
+        Rc::new(move || {
+            let refresh = refresh.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(f) = refresh.borrow().as_ref() {
+                    f();
+                }
+            });
+        })
+    };
     let build = {
         let weak = Rc::downgrade(app);
         let list = list.clone();
-        let refresh = refresh.clone();
+        let rebuild_later = rebuild_later.clone();
         move || {
             let Some(app) = weak.upgrade() else { return };
             while let Some(child) = list.first_child() {
@@ -1908,48 +1956,68 @@ pub fn tag_manager(app: &Rc<App>) {
                 list.append(&gtk::Label::new(Some("No tags yet.")));
             }
             for tag in tags {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                row.set_margin_top(3);
-                row.set_margin_bottom(3);
+                // Identity on top, controls underneath, so every action stays
+                // reachable even when the dialog is narrow.
+                let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                row.add_css_class("card");
+                row.set_margin_top(2);
+                row.set_margin_bottom(2);
+                let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                top.set_margin_top(4);
+                top.set_margin_start(6);
+                top.set_margin_end(6);
                 let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
                 dot.add_css_class("color-dot");
                 dot.add_css_class(&format!("swatch-{}", crate::theme::color_class(&tag.color)));
                 dot.set_size_request(12, 12);
                 dot.set_valign(gtk::Align::Center);
-                row.append(&dot);
+                top.append(&dot);
                 let name = gtk::Entry::new();
                 name.set_text(&tag.name);
                 name.set_hexpand(true);
-                row.append(&name);
+                name.set_tooltip_text(Some("Press Enter or Save to rename"));
+                top.append(&name);
                 let count = app.meta.borrow().paths_with_tags(&[tag.id.clone()], false).len();
                 let count_label = gtk::Label::new(Some(&format!("{count} item(s)")));
                 count_label.add_css_class("tiny");
                 count_label.add_css_class("dim");
-                row.append(&count_label);
+                top.append(&count_label);
+                row.append(&top);
+                let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                actions.set_halign(gtk::Align::End);
+                actions.set_margin_start(6);
+                actions.set_margin_end(6);
+                actions.set_margin_bottom(4);
+                let apply_rename: Rc<dyn Fn(&gtk::Entry)> = {
+                    let weak = Rc::downgrade(&app);
+                    let rebuild_later = rebuild_later.clone();
+                    let id = tag.id.clone();
+                    Rc::new(move |entry: &gtk::Entry| {
+                        let Some(app) = weak.upgrade() else { return };
+                        let text = entry.text();
+                        let result = app.meta.borrow_mut().rename_tag(&id, &text);
+                        match result {
+                            Ok(()) => {
+                                app.refresh_after_metadata_change();
+                                app.notify("Tag renamed", false);
+                                rebuild_later();
+                            }
+                            Err(err) => app.notify(&err, true),
+                        }
+                    })
+                };
                 let save = gtk::Button::with_label("Save");
                 save.add_css_class("flat");
                 {
-                    let weak = Rc::downgrade(&app);
-                    let refresh = refresh.clone();
-                    let id = tag.id.clone();
+                    let apply_rename = apply_rename.clone();
                     let name = name.clone();
-                    save.connect_clicked(move |_| {
-                        if let Some(app) = weak.upgrade() {
-                            let result = app.meta.borrow_mut().rename_tag(&id, &name.text());
-                            match result {
-                                Ok(()) => {
-                                    app.refresh_sidebar();
-                                    app.notify("Tag renamed", false);
-                                    if let Some(f) = refresh.borrow().as_ref() {
-                                        f();
-                                    }
-                                }
-                                Err(err) => app.notify(&err, true),
-                            }
-                        }
-                    });
+                    save.connect_clicked(move |_| apply_rename(&name));
                 }
-                row.append(&save);
+                {
+                    let apply_rename = apply_rename.clone();
+                    name.connect_activate(move |entry| apply_rename(entry));
+                }
+                actions.append(&save);
                 let icon_btn = gtk::MenuButton::new();
                 icon_btn.set_label("Icon");
                 icon_btn.add_css_class("flat");
@@ -1969,19 +2037,16 @@ pub fn tag_manager(app: &Rc<App>) {
                     choice.set_child(Some(&body));
                     {
                         let weak = Rc::downgrade(&app);
-                        let refresh = refresh.clone();
+                        let rebuild_later = rebuild_later.clone();
                         let id = tag.id.clone();
                         let icon_name = (*icon_name).to_string();
                         let icon_pop = icon_pop.clone();
                         choice.connect_clicked(move |_| {
                             if let Some(app) = weak.upgrade() {
                                 app.meta.borrow_mut().set_tag_icon(&id, &icon_name);
-                                app.refresh_sidebar();
                                 app.refresh_after_metadata_change();
                                 icon_pop.popdown();
-                                if let Some(f) = refresh.borrow().as_ref() {
-                                    f();
-                                }
+                                rebuild_later();
                             }
                         });
                     }
@@ -1989,60 +2054,62 @@ pub fn tag_manager(app: &Rc<App>) {
                 }
                 icon_pop.set_child(Some(&icon_list));
                 icon_btn.set_popover(Some(&icon_pop));
-                row.append(&icon_btn);
+                actions.append(&icon_btn);
                 let recolour = gtk::Button::with_label("Colour");
                 recolour.add_css_class("flat");
                 {
                     let weak = Rc::downgrade(&app);
-                    let refresh = refresh.clone();
+                    let rebuild_later = rebuild_later.clone();
                     let id = tag.id.clone();
                     let current = tag.color.clone();
-                    recolour.connect_clicked(move |_| {
+                    recolour.connect_clicked(move |button| {
                         let Some(app) = weak.upgrade() else { return };
                         let dialog = gtk::ColorDialog::new();
                         dialog.set_with_alpha(false);
                         let weak = Rc::downgrade(&app);
-                        let refresh = refresh.clone();
+                        let rebuild_later = rebuild_later.clone();
                         let id = id.clone();
+                        let parent = button.root().and_then(|r| r.downcast::<gtk::Window>().ok());
                         dialog.choose_rgba(
-                            Some(&app.window),
+                            parent.as_ref(),
                             Some(&gdk_rgba(&current)),
                             None::<&gio::Cancellable>,
                             move |result| {
-                                if let Ok(color) = result {
-                                    if let Some(app) = weak.upgrade() {
-                                        let hex = crate::util::color_to_hex(
-                                            (color.red() * 255.0) as u8,
-                                            (color.green() * 255.0) as u8,
-                                            (color.blue() * 255.0) as u8,
-                                        );
-                                        app.meta.borrow_mut().recolor_tag(&id, &hex);
-                                        app.refresh_sidebar();
-                                        app.refresh_after_metadata_change();
-                                        if let Some(f) = refresh.borrow().as_ref() {
-                                            f();
-                                        }
-                                    }
-                                }
+                                let Ok(color) = result else { return };
+                                let Some(app) = weak.upgrade() else { return };
+                                let hex = crate::util::color_to_hex(
+                                    (color.red() * 255.0) as u8,
+                                    (color.green() * 255.0) as u8,
+                                    (color.blue() * 255.0) as u8,
+                                );
+                                app.meta.borrow_mut().recolor_tag(&id, &hex);
+                                app.refresh_after_metadata_change();
+                                rebuild_later();
                             },
                         );
                     });
                 }
-                row.append(&recolour);
+                actions.append(&recolour);
                 let delete = gtk::Button::with_label("Delete");
                 delete.add_css_class("flat");
                 delete.add_css_class("danger");
                 {
                     let weak = Rc::downgrade(&app);
-                    let refresh = refresh.clone();
+                    let rebuild_later = rebuild_later.clone();
                     let id = tag.id.clone();
                     let name_text = tag.name.clone();
-                    delete.connect_clicked(move |_| {
+                    delete.connect_clicked(move |button| {
                         let Some(app) = weak.upgrade() else { return };
+                        let Some(parent) = button.root().and_then(|r| r.downcast::<gtk::Window>().ok()) else {
+                            return;
+                        };
                         let app_c = app.clone();
-                        let refresh = refresh.clone();
+                        let rebuild_later = rebuild_later.clone();
                         let id = id.clone();
-                        confirm(
+                        // Parent the confirmation to the tag manager; otherwise
+                        // it can open behind the modal manager and look dead.
+                        confirm_for(
+                            &parent,
                             &app,
                             "Delete tag?",
                             &format!(
@@ -2052,16 +2119,15 @@ pub fn tag_manager(app: &Rc<App>) {
                             true,
                             move |_| {
                                 app_c.meta.borrow_mut().delete_tag(&id);
-                                app_c.refresh_sidebar();
                                 app_c.refresh_after_metadata_change();
-                                if let Some(f) = refresh.borrow().as_ref() {
-                                    f();
-                                }
+                                app_c.notify("Tag deleted", false);
+                                rebuild_later();
                             },
                         );
                     });
                 }
-                row.append(&delete);
+                actions.append(&delete);
+                row.append(&actions);
                 list.append(&row);
             }
         }
@@ -2085,32 +2151,29 @@ pub fn tag_manager(app: &Rc<App>) {
     }
     {
         let weak = Rc::downgrade(app);
-        let build = build.clone();
+        let manager_window = window.clone();
+        let rebuild_later = rebuild_later.clone();
         new_tag.connect_clicked(move |_| {
-            if let Some(app) = weak.upgrade() {
-                create_tag_dialog(&app);
-                // Rebuild after the dialog is dismissed by the user.
-                let build = build.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || build());
-            }
+            let Some(app) = weak.upgrade() else { return };
+            let created = create_tag_dialog_for(&app, &manager_window);
+            let rebuild_later = rebuild_later.clone();
+            created.connect_destroy(move |_| rebuild_later());
         });
     }
     {
         let weak = Rc::downgrade(app);
-        let refresh = refresh.clone();
+        let rebuild_later = rebuild_later.clone();
         cleanup.connect_clicked(move |_| {
             if let Some(app) = weak.upgrade() {
                 let removed = app.meta.borrow_mut().cleanup();
-                app.refresh_sidebar();
                 app.refresh_after_metadata_change();
                 app.notify(&format!("Removed {removed} stale metadata entr(ies)"), false);
-                if let Some(f) = refresh.borrow().as_ref() {
-                    f();
-                }
+                rebuild_later();
             }
         });
     }
     window.present();
+    window
 }
 
 fn gdk_rgba(value: &str) -> gtk4::gdk::RGBA {
@@ -2153,7 +2216,7 @@ pub fn settings_window(app: &Rc<App>, section: Option<&str>) {
         ("layout".into(), layout_page(app)),
         ("files".into(), files_page(app)),
         ("thumbnails".into(), thumbnails_page(app)),
-        ("tags".into(), tags_page(app)),
+        ("tags".into(), tags_page(app, &window)),
         ("terminal".into(), terminal_page(app, &window)),
         ("commands".into(), commands_page(app)),
         ("keyboard".into(), keyboard_page(app)),
@@ -3468,7 +3531,7 @@ fn thumbnails_page(app: &Rc<App>) -> gtk::Widget {
     scroller.upcast()
 }
 
-fn tags_page(app: &Rc<App>) -> gtk::Widget {
+fn tags_page(app: &Rc<App>, parent: &gtk::Window) -> gtk::Widget {
     let (scroller, inner) = page_container(
         "Tags & colours",
         "Tags and folder colours are stored in Delve's metadata database using stable file identity.",
@@ -3476,9 +3539,10 @@ fn tags_page(app: &Rc<App>) -> gtk::Widget {
     let manage = gtk::Button::with_label("Manage tags…");
     {
         let weak = Rc::downgrade(app);
+        let parent = parent.clone();
         manage.connect_clicked(move |_| {
             if let Some(app) = weak.upgrade() {
-                tag_manager(&app);
+                tag_manager_for(&app, &parent);
             }
         });
     }
@@ -4754,6 +4818,11 @@ impl App {
 
 /// Ask which application should open a file type. The choice is stored in
 /// settings and reused for every later file of the same MIME type.
+///
+/// The dialog keeps the installed-application suggestions and adds an advanced
+/// bar where a command or an application file can be supplied directly. Saved
+/// commands become suggestions for that MIME type, and either kind of choice
+/// can be remembered as the type's default.
 pub fn open_with_dialog(app: &Rc<App>, entry: &Entry) {
     let mime = entry.mime();
     let default_app = gio::AppInfo::default_for_type(&mime, false);
@@ -4769,16 +4838,26 @@ pub fn open_with_dialog(app: &Rc<App>, entry: &Entry) {
     }
     apps.sort_by_key(|a| a.display_name().to_lowercase());
     apps.dedup_by(|a, b| a.id() == b.id());
-    if apps.is_empty() {
-        app.notify(
-            &format!("No application is installed to open “{}”.", entry.name),
-            true,
-        );
-        return;
-    }
     let system_default = default_app.and_then(|a| a.id()).map(|id| id.to_string());
+    let saved_app = app.settings.borrow().default_apps.get(&mime).cloned();
+    let saved_command = app.settings.borrow().default_commands.get(&mime).cloned();
+    let custom_apps = app
+        .settings
+        .borrow()
+        .custom_apps
+        .get(&mime)
+        .cloned()
+        .unwrap_or_default();
+    let has_saved_choice = saved_app
+        .as_deref()
+        .map(|id| !id.is_empty())
+        .unwrap_or(false)
+        || saved_command
+            .as_deref()
+            .map(|command| !command.trim().is_empty())
+            .unwrap_or(false);
 
-    let window = dialog_window(app, "Open with", 470, 500);
+    let window = dialog_window(app, "Open with", 600, 700);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.set_margin_top(14);
     root.set_margin_bottom(12);
@@ -4786,25 +4865,57 @@ pub fn open_with_dialog(app: &Rc<App>, entry: &Entry) {
     root.set_margin_end(14);
     root.append(&header(
         "Open with",
-        &format!(
-            "Choose the app Delve should use for {} files from now on.",
-            entry.type_label().to_lowercase()
-        ),
+        "Choose a suggested application, or open this file with any command or application location.",
     ));
-    let file_label = gtk::Label::new(Some(&entry.name));
-    file_label.add_css_class("hint");
-    file_label.set_xalign(0.0);
-    file_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    file_label.set_tooltip_text(Some(&entry.path.display().to_string()));
-    root.append(&file_label);
+    let file_box = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    let file_name = gtk::Label::new(Some(&entry.name));
+    file_name.set_xalign(0.0);
+    file_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    file_name.set_tooltip_text(Some(&entry.path.display().to_string()));
+    file_box.append(&file_name);
+    let file_hint = gtk::Label::new(Some(&format!(
+        "{} · {}",
+        entry.type_label(),
+        mime
+    )));
+    file_hint.add_css_class("tiny");
+    file_hint.add_css_class("dim");
+    file_hint.set_xalign(0.0);
+    file_hint.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    file_box.append(&file_hint);
+    root.append(&file_box);
+
+    let filter = gtk::SearchEntry::new();
+    filter.set_placeholder_text(Some("Filter applications and saved commands"));
+    root.append(&filter);
+
+    let suggestions_title = gtk::Label::new(Some("SUGGESTED APPLICATIONS"));
+    suggestions_title.add_css_class("section-title");
+    suggestions_title.set_xalign(0.0);
+    root.append(&suggestions_title);
 
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&list)
         .vexpand(true)
+        .min_content_height(150)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     root.append(&scroller);
+
+    // Rows stay in one place; filtering only toggles visibility. Each entry
+    // carries the lowercase text used by the filter bar.
+    let rows: Rc<RefCell<Vec<(gtk::Widget, String)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    if apps.is_empty() && custom_apps.is_empty() {
+        let hint = gtk::Label::new(Some(
+            "No installed application is registered for this file type. Use a command below.",
+        ));
+        hint.add_css_class("hint");
+        hint.set_xalign(0.0);
+        hint.set_wrap(true);
+        list.append(&hint);
+    }
 
     for info in apps {
         let row = gtk::Button::new();
@@ -4836,13 +4947,20 @@ pub fn open_with_dialog(app: &Rc<App>, entry: &Entry) {
             texts.append(&hint);
         }
         body.append(&texts);
-        if info.id().as_deref() == system_default.as_deref() {
+        if saved_app.as_deref() == info.id().as_deref() {
+            let badge = gtk::Label::new(Some("Saved choice"));
+            badge.add_css_class("tiny");
+            badge.add_css_class("dim");
+            body.append(&badge);
+        } else if info.id().as_deref() == system_default.as_deref() {
             let badge = gtk::Label::new(Some("System default"));
             badge.add_css_class("tiny");
             badge.add_css_class("dim");
             body.append(&badge);
         }
         row.set_child(Some(&body));
+        let search = format!("{} {}", info.display_name(), description);
+        rows.borrow_mut().push((row.clone().upcast(), search));
         {
             let app = app.clone();
             let window = window.clone();
@@ -4853,9 +4971,11 @@ pub fn open_with_dialog(app: &Rc<App>, entry: &Entry) {
                 {
                     let mut settings = app.settings.borrow_mut();
                     settings.default_apps.insert(
-                        mime,
+                        mime.clone(),
                         info.id().map(|id| id.to_string()).unwrap_or_default(),
                     );
+                    // Installed apps and custom commands are exclusive defaults.
+                    settings.default_commands.remove(&mime);
                     settings.save();
                 }
                 app.launch_file_with(&entry, &info);
@@ -4865,15 +4985,252 @@ pub fn open_with_dialog(app: &Rc<App>, entry: &Entry) {
         list.append(&row);
     }
 
+    for custom in custom_apps {
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        let row = gtk::Button::new();
+        row.add_css_class("flat");
+        row.add_css_class("view-menu-row");
+        row.set_hexpand(true);
+        row.set_halign(gtk::Align::Fill);
+        let body = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let image = gtk::Image::from_icon_name("application-x-executable-symbolic");
+        image.set_pixel_size(24);
+        body.append(&image);
+        let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        texts.set_hexpand(true);
+        let name = gtk::Label::new(Some(if custom.label.is_empty() {
+            "Custom command"
+        } else {
+            &custom.label
+        }));
+        name.set_xalign(0.0);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        texts.append(&name);
+        let hint = gtk::Label::new(Some(&crate::util::ellipsize(&custom.command, 72)));
+        hint.add_css_class("tiny");
+        hint.add_css_class("dim");
+        hint.set_xalign(0.0);
+        hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        texts.append(&hint);
+        body.append(&texts);
+        let badge = gtk::Label::new(Some(if saved_command.as_deref() == Some(custom.command.as_str()) {
+            "Saved choice"
+        } else {
+            "Custom"
+        }));
+        badge.add_css_class("tiny");
+        badge.add_css_class("dim");
+        body.append(&badge);
+        row.set_child(Some(&body));
+        {
+            let app = app.clone();
+            let window = window.clone();
+            let entry = entry.clone();
+            let command = custom.command.clone();
+            row.connect_clicked(move |_| match app.launch_file_with_command(&entry, &command, true) {
+                Ok(()) => window.close(),
+                Err(err) => app.notify(&err, true),
+            });
+        }
+        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove.add_css_class("flat");
+        remove.set_tooltip_text(Some("Remove this saved command"));
+        {
+            let weak = Rc::downgrade(app);
+            let rows = rows.clone();
+            let container = container.clone();
+            let mime = mime.clone();
+            let command = custom.command.clone();
+            remove.connect_clicked(move |_| {
+                let Some(app) = weak.upgrade() else { return };
+                {
+                    let mut settings = app.settings.borrow_mut();
+                    if let Some(list) = settings.custom_apps.get_mut(&mime) {
+                        list.retain(|item| item.command != command);
+                        if list.is_empty() {
+                            settings.custom_apps.remove(&mime);
+                        }
+                    }
+                    if settings.default_commands.get(&mime) == Some(&command) {
+                        settings.default_commands.remove(&mime);
+                    }
+                    settings.save();
+                }
+                container.set_visible(false);
+                rows.borrow_mut().retain(|(widget, _)| widget != &container);
+            });
+        }
+        container.append(&row);
+        container.append(&remove);
+        let search = format!("{} {}", custom.label, custom.command);
+        rows.borrow_mut().push((container.clone().upcast(), search));
+        list.append(&container);
+    }
+
+    {
+        let rows = rows.clone();
+        filter.connect_search_changed(move |entry| {
+            let query = entry.text().trim().to_lowercase();
+            for (widget, search) in rows.borrow().iter() {
+                widget.set_visible(query.is_empty() || search.contains(&query));
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Advanced: command or application location
+    // ------------------------------------------------------------------
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let advanced_title = gtk::Label::new(Some("OPEN WITH A COMMAND OR APP LOCATION"));
+    advanced_title.add_css_class("section-title");
+    advanced_title.set_xalign(0.0);
+    root.append(&advanced_title);
+    let advanced_hint = gtk::Label::new(Some(
+        "Type an executable or command, or choose its file. %f becomes the file path and \
+         %u its URI; with neither, the path is appended as the last argument.",
+    ));
+    advanced_hint.add_css_class("tiny");
+    advanced_hint.add_css_class("dim");
+    advanced_hint.set_xalign(0.0);
+    advanced_hint.set_wrap(true);
+    root.append(&advanced_hint);
+
+    let command_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let command_entry = gtk::Entry::new();
+    command_entry.set_placeholder_text(Some("e.g. /usr/bin/gimp or my-editor %f"));
+    command_entry.set_hexpand(true);
+    command_row.append(&command_entry);
+    let browse = gtk::Button::with_label("Browse…");
+    command_row.append(&browse);
+    root.append(&command_row);
+
+    let options_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let remember =
+        gtk::CheckButton::with_label("Remember this choice for all files of this type");
+    remember.set_active(saved_command.is_some());
+    options_row.append(&remember);
+    root.append(&options_row);
+
+    let error = gtk::Label::new(None);
+    error.add_css_class("danger");
+    error.add_css_class("tiny");
+    error.set_xalign(0.0);
+    error.set_wrap(true);
+    error.set_visible(false);
+    root.append(&error);
+
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
+    if has_saved_choice {
+        let forget = gtk::Button::with_label("Clear saved choice");
+        forget.add_css_class("flat");
+        {
+            let weak = Rc::downgrade(app);
+            let window = window.clone();
+            let mime = mime.clone();
+            forget.connect_clicked(move |_| {
+                let Some(app) = weak.upgrade() else { return };
+                {
+                    let mut settings = app.settings.borrow_mut();
+                    settings.default_apps.remove(&mime);
+                    settings.default_commands.remove(&mime);
+                    settings.save();
+                }
+                app.notify("Delve will suggest applications again for this file type", false);
+                window.close();
+            });
+        }
+        buttons.append(&forget);
+    }
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    buttons.append(&spacer);
     let cancel = gtk::Button::with_label("Cancel");
     buttons.append(&cancel);
+    let open_custom = gtk::Button::with_label(if remember.is_active() {
+        "Open and remember"
+    } else {
+        "Open once"
+    });
+    open_custom.add_css_class("suggested");
+    buttons.append(&open_custom);
     root.append(&buttons);
+
     window.set_child(Some(&root));
     {
         let window = window.clone();
         cancel.connect_clicked(move |_| window.close());
     }
+    {
+        let weak = Rc::downgrade(app);
+        let window = window.clone();
+        let entry = entry.clone();
+        let command_entry = command_entry.clone();
+        let remember = remember.clone();
+        let error = error.clone();
+        let submit: Rc<dyn Fn()> = {
+            let weak = weak.clone();
+            let window = window.clone();
+            let entry = entry.clone();
+            let command_entry = command_entry.clone();
+            let remember = remember.clone();
+            let error = error.clone();
+            Rc::new(move || {
+                let Some(app) = weak.upgrade() else { return };
+                let command = command_entry.text().to_string();
+                if command.trim().is_empty() {
+                    error.set_text("Enter a command or choose an application file.");
+                    error.set_visible(true);
+                    command_entry.grab_focus();
+                    return;
+                }
+                match app.launch_file_with_command(&entry, &command, remember.is_active()) {
+                    Ok(()) => window.close(),
+                    Err(err) => {
+                        error.set_text(&err);
+                        error.set_visible(true);
+                    }
+                }
+            })
+        };
+        {
+            let submit = submit.clone();
+            open_custom.connect_clicked(move |_| submit());
+        }
+        {
+            let submit = submit.clone();
+            command_entry.connect_activate(move |_| submit());
+        }
+        {
+            let open_custom = open_custom.clone();
+            remember.connect_toggled(move |check| {
+                open_custom.set_label(if check.is_active() {
+                    "Open and remember"
+                } else {
+                    "Open once"
+                });
+            });
+        }
+        {
+            let window = window.clone();
+            let command_entry = command_entry.clone();
+            browse.connect_clicked(move |_| {
+                let chooser = gtk::FileDialog::new();
+                chooser.set_title("Choose an application");
+                let command_entry = command_entry.clone();
+                chooser.open(
+                    Some(&window),
+                    None::<&gio::Cancellable>,
+                    move |result| {
+                        let Ok(file) = result else { return };
+                        let Some(path) = file.path() else { return };
+                        command_entry.set_text(&format!("\"{}\"", path.display()));
+                    },
+                );
+            });
+        }
+        let _ = weak;
+    }
     window.present();
+    command_entry.grab_focus();
 }

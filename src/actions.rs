@@ -127,6 +127,14 @@ impl App {
                 return;
             }
         }
+        // A remembered custom command wins over asking again.
+        let saved_command = self.settings.borrow().default_commands.get(&mime).cloned();
+        if let Some(command) = saved_command.filter(|command| !command.trim().is_empty()) {
+            match self.launch_file_with_command(entry, &command, false) {
+                Ok(()) => return,
+                Err(err) => self.notify(&err, true),
+            }
+        }
         if gio::AppInfo::all_for_type(&mime).is_empty() {
             // Nothing is registered for this type; let the desktop decide.
             {
@@ -164,6 +172,78 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Open a file with a user-supplied command or executable location.
+    /// `%f` expands to the file path and `%u` to its URI; with neither the path
+    /// is appended as the final argument. No shell is involved.
+    pub fn launch_file_with_command(
+        self: &Rc<Self>,
+        entry: &Entry,
+        command: &str,
+        remember: bool,
+    ) -> Result<(), String> {
+        let command = command.trim();
+        let parsed = crate::terminal::split_args(command);
+        let Some(program) = parsed.first() else {
+            return Err("Enter an application or command first.".into());
+        };
+        let program = crate::thumbnails::which(program).ok_or_else(|| {
+            format!(
+                "“{program}” was not found. Check the name, or choose the application file."
+            )
+        })?;
+        let file = entry.path.to_string_lossy().to_string();
+        let uri = fs::uri_for(&entry.path);
+        let mut args: Vec<String> = Vec::new();
+        let mut substituted = false;
+        for arg in &parsed[1..] {
+            let mut value = arg.clone();
+            if value.contains("%f") {
+                value = value.replace("%f", &file);
+                substituted = true;
+            }
+            if value.contains("%u") {
+                value = value.replace("%u", &uri);
+                substituted = true;
+            }
+            args.push(value);
+        }
+        if !substituted {
+            args.push(file);
+        }
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn()
+            .map_err(|err| format!("Could not open “{}”: {err}", entry.name))?;
+        {
+            let mut settings = self.settings.borrow_mut();
+            settings.add_recent_file(&entry.path);
+            if remember {
+                let mime = entry.mime();
+                let label = program
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| command.to_string());
+                settings.default_apps.remove(&mime);
+                settings
+                    .default_commands
+                    .insert(mime.clone(), command.to_string());
+                let list = settings.custom_apps.entry(mime).or_default();
+                match list.iter_mut().find(|item| item.command == command) {
+                    Some(item) => item.label = label,
+                    None => list.push(crate::settings::CustomApp {
+                        label,
+                        command: command.to_string(),
+                    }),
+                }
+            }
+            settings.save();
+        }
+        Ok(())
     }
 
     pub fn open_containing_folder(self: &Rc<Self>) {
@@ -253,36 +333,36 @@ impl App {
         }
     }
 
-    /// Generate thumbnails on a worker thread, then refresh visible icon cells.
+    /// Queue previews for items the user cannot see yet.
     pub fn queue_thumbnails(self: &Rc<Self>, jobs: Vec<(PathBuf, Entry)>, size: u32) {
-        let mut todo = Vec::new();
-        {
-            let cache = self.thumbs.borrow();
-            let mut pending = self.thumb_pending.borrow_mut();
-            for (path, entry) in jobs {
-                if cache.contains_key(&path) || !pending.insert(path) {
-                    continue;
-                }
-                todo.push(entry);
+        self.queue_thumbnails_with_priority(jobs, size, false);
+    }
+
+    /// Queue previews for the currently visible items so they are decoded before
+    /// anything further down the folder.
+    pub fn queue_visible_thumbnails(self: &Rc<Self>, jobs: Vec<(PathBuf, Entry)>, size: u32) {
+        self.queue_thumbnails_with_priority(jobs, size, true);
+    }
+
+    fn queue_thumbnails_with_priority(
+        self: &Rc<Self>,
+        jobs: Vec<(PathBuf, Entry)>,
+        size: u32,
+        urgent: bool,
+    ) {
+        let size = size.max(32);
+        let cache = self.thumbs.borrow();
+        let mut pending = self.thumb_pending.borrow_mut();
+        for (path, entry) in jobs {
+            if cache.contains_key(&path) || pending.contains(&path) {
+                continue;
+            }
+            // A suppressed preview (unsupported type, missing decoder) is kept
+            // in the cache as `None` so it is never attempted twice.
+            if self.thumb_queue.push(entry, size, urgent) {
+                pending.insert(path);
             }
         }
-        if todo.is_empty() {
-            return;
-        }
-        // Publish each finished thumbnail immediately, in the order the
-        // folder listed them, so the first screenful fills in instead of
-        // waiting for the whole folder.
-        std::thread::spawn(move || {
-            for entry in todo {
-                let thumb = crate::thumbnails::thumbnail_for(&entry, size);
-                let path = entry.path;
-                crate::dispatch::post_simple(move |app| {
-                    app.thumb_pending.borrow_mut().remove(&path);
-                    app.thumbs.borrow_mut().insert(path, thumb);
-                    app.schedule_thumb_refresh();
-                });
-            }
-        });
     }
 
     /// Coalesce thumbnail repaints into one idle callback.
@@ -310,11 +390,36 @@ impl App {
     fn perform_permanent_delete(self: &Rc<Self>, paths: &[PathBuf]) {
         let paths = paths.to_vec();
         let for_op = paths.clone();
-        self.run_operation("Deleting items", move |cancel, progress| {
-            ops::delete_permanent(&for_op, cancel, Some(progress))
-        });
-        self.reload_tabs_for(&paths);
-        self.refresh_after_metadata_change();
+        let for_reload = paths.clone();
+        // Deletion runs on a worker thread, so the refresh has to wait for the
+        // finished outcome instead of reloading the (still unchanged) listing.
+        self.run_operation_with_done(
+            "Deleting items",
+            move |cancel, progress| ops::delete_permanent(&for_op, cancel, Some(progress)),
+            Some(Box::new(move |app, _outcome| {
+                app.reload_tabs_for(&for_reload);
+                app.reload_trash_tabs();
+                app.refresh_after_metadata_change();
+            })),
+        );
+    }
+
+    /// Reload every tab that shows the Trash. Trashed entries live in the trash
+    /// directory rather than in a listed folder, so a path-based reload never
+    /// reaches these tabs.
+    pub fn reload_trash_tabs(self: &Rc<Self>) {
+        let ids: Vec<u64> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| matches!(tab.state.borrow().location, Location::Trash))
+            .map(|tab| tab.id)
+            .collect();
+        for id in ids {
+            self.load(id);
+        }
+        self.refresh_sidebar();
+        self.update_status();
     }
 
     pub fn begin_transfer(
@@ -1089,9 +1194,8 @@ impl App {
         match trash::os_limited::restore_all(target) {
             Ok(()) => {
                 self.notify("Restored from Trash", false);
-                if let Some(tab) = self.active_tab() {
-                    self.load(tab.id);
-                }
+                self.reload_trash_tabs();
+                self.update_toolbar();
             }
             Err(err) => self.notify(&format!("Could not restore: {err}"), true),
         }
@@ -1116,9 +1220,7 @@ impl App {
                         .unwrap_or_else(|| "Could not empty Trash".into());
                     app.notify(&msg, true);
                 }
-                if let Some(tab) = app.active_tab() {
-                    app.load(tab.id);
-                }
+                app.reload_trash_tabs();
             },
         );
     }
@@ -1200,7 +1302,7 @@ impl App {
             ("sidebar", Box::new(|a| {
                 // The sidebar cannot be fully hidden; F9 flips the compact
                 // icon rail instead.
-                let mini = a.settings.borrow().sidebar_mini;
+                let mini = a.sidebar_is_mini();
                 a.set_sidebar_mini(!mini);
             })),
             ("inspector", Box::new(|a| {
@@ -1481,6 +1583,13 @@ impl App {
         };
         item("New folder", Some("Ctrl+Shift+N"), Box::new(|a| a.create_folder_or_file(true)));
         item("New empty file", None, Box::new(|a| a.create_folder_or_file(false)));
+        item("Cut", Some("Ctrl+X"), Box::new(|a| a.copy_selection_to_clipboard(true)));
+        item("Copy", Some("Ctrl+C"), Box::new(|a| a.copy_selection_to_clipboard(false)));
+        item("Paste", Some("Ctrl+V"), Box::new(|a| a.paste_into_current()));
+        item("Move to Trash", Some("Delete"), Box::new(|a| a.delete_selection(false)));
+        item("Undo", Some("Ctrl+Z"), Box::new(|a| a.undo()));
+        item("Redo", Some("Ctrl+Shift+Z"), Box::new(|a| a.redo()));
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         item("Rename…", Some("F2"), Box::new(|a| a.rename_selection()));
         item("Duplicate", Some("Ctrl+D"), Box::new(|a| a.duplicate_selection()));
         item("Create symbolic link", None, Box::new(|a| a.create_links()));
@@ -1815,6 +1924,15 @@ impl App {
                 .filter(|e| e.is_dir)
                 .map(|e| e.path.clone())
                 .collect();
+            if let Some(first) = folder_paths.first().cloned() {
+                let pinned = self.settings.borrow().is_pinned(&first);
+                add(
+                    if pinned { "Unpin from sidebar" } else { "Pin to sidebar" },
+                    None,
+                    true,
+                    Box::new(move |a| a.toggle_pinned(&first)),
+                );
+            }
             if !folder_paths.is_empty() {
                 let row = gtk::Button::with_label("Folder colour…");
                 row.add_css_class("flat");
@@ -1996,9 +2114,260 @@ impl App {
         popover.popup();
     }
 
+    /// Pin or unpin a folder. Both the sidebar and the dashboard follow the
+    /// setting immediately.
+    pub fn toggle_pinned(self: &Rc<Self>, path: &std::path::Path) {
+        let pinned = {
+            let mut settings = self.settings.borrow_mut();
+            let now = settings.toggle_pinned(path);
+            settings.save();
+            now
+        };
+        self.notify(
+            if pinned {
+                "Pinned to the sidebar"
+            } else {
+                "Removed from pinned folders"
+            },
+            false,
+        );
+        self.refresh_sidebar();
+        self.refresh_home_dashboard();
+    }
+
+    /// Mount a removable volume and open it. Used by the dashboard and the
+    /// sidebar's System section.
+    pub fn mount_volume(self: &Rc<Self>, volume: &crate::volumes::VolumeInfo) {
+        let weak = Rc::downgrade(self);
+        crate::volumes::mount_volume(self, volume, move |path, error| {
+            let Some(app) = weak.upgrade() else { return };
+            match (path, error) {
+                (Some(path), _) => {
+                    app.notify(&format!("Mounted {}", path.display()), false);
+                    app.refresh_sidebar();
+                    app.refresh_home_dashboard();
+                    app.navigate_active(Location::Path(path));
+                }
+                (None, Some(error)) => app.notify(&error, true),
+                (None, None) => {}
+            }
+        });
+    }
+
+    /// Unmount/eject the volume at `mount_point`.
+    pub fn eject_volume(self: &Rc<Self>, mount_point: &std::path::Path) {
+        let weak = Rc::downgrade(self);
+        let path = mount_point.to_path_buf();
+        crate::volumes::unmount(self, mount_point, move |result| {
+            let Some(app) = weak.upgrade() else { return };
+            match result {
+                Ok(()) => {
+                    // If the current tab lives on that volume, move somewhere
+                    // that still exists rather than leaving a broken listing.
+                    if app
+                        .active_tab()
+                        .and_then(|tab| tab.state.borrow().location.path().cloned())
+                        .map(|p| p.starts_with(&path))
+                        .unwrap_or(false)
+                    {
+                        app.navigate_active(Location::Home);
+                    }
+                    app.notify("Volume unmounted safely", false);
+                }
+                Err(error) => app.notify(&error, true),
+            }
+            app.refresh_sidebar();
+            app.refresh_home_dashboard();
+        });
+    }
+
+    /// Compact context menu for a folder path, shared by the sidebar, the
+    /// location bar and dashboard rows.
+    pub fn show_path_context_menu(
+        self: &Rc<Self>,
+        anchor: &impl IsA<gtk::Widget>,
+        path: std::path::PathBuf,
+        x: f64,
+        y: f64,
+    ) {
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
+        popover.add_css_class("context-menu");
+        popover.set_parent(anchor);
+        if x > 0.0 || y > 0.0 {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        }
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        list.set_width_request(236);
+        list.add_css_class("context-list");
+
+        let is_current = self
+            .active_tab()
+            .and_then(|tab| tab.state.borrow().location.path().cloned())
+            .map(|p| p == path)
+            .unwrap_or(false);
+        let pinned = self.settings.borrow().is_pinned(&path);
+        let add = |label: &str, accel: Option<&str>, action: Box<dyn Fn(&Rc<App>)>| {
+            let row = gtk::Button::new();
+            row.add_css_class("flat");
+            let body = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            if let Some(icon_name) = context_icon(label) {
+                let image = gtk::Image::from_icon_name(icon_name);
+                image.set_pixel_size(16);
+                image.add_css_class("context-icon");
+                body.append(&image);
+            }
+            let text = gtk::Label::new(Some(label));
+            text.set_xalign(0.0);
+            text.set_hexpand(true);
+            body.append(&text);
+            if let Some(accel) = accel {
+                let hint = gtk::Label::new(Some(accel));
+                hint.add_css_class("tiny");
+                hint.add_css_class("dim");
+                body.append(&hint);
+            }
+            row.set_child(Some(&body));
+            let weak = Rc::downgrade(self);
+            let popover_ref = popover.clone();
+            row.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    popover_ref.popdown();
+                    action(&app);
+                }
+            });
+            list.append(&row);
+        };
+
+        {
+            let target = path.clone();
+            add("Open", None, Box::new(move |a| {
+                a.navigate_active(Location::Path(target.clone()));
+            }));
+        }
+        {
+            let target = path.clone();
+            add("Open in new tab", None, Box::new(move |a| {
+                a.new_tab(Location::Path(target.clone()));
+            }));
+        }
+        add("Open in terminal", None, Box::new({
+            let target = path.clone();
+            move |a| {
+                let settings = a.settings.borrow().clone();
+                if let Err(err) = crate::terminal::launch_terminal(&settings, &target) {
+                    a.notify(&err, true);
+                }
+            }
+        }));
+        if is_current {
+            add("New folder", Some("Ctrl+Shift+N"), Box::new(|a| a.create_folder_or_file(true)));
+            add("Paste", Some("Ctrl+V"), Box::new(|a| a.paste_into_current()));
+        }
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        add(
+            if pinned { "Unpin from sidebar" } else { "Pin to sidebar" },
+            None,
+            Box::new({
+                let target = path.clone();
+                move |a| a.toggle_pinned(&target)
+            }),
+        );
+        add("Copy path", None, Box::new({
+            let target = path.clone();
+            move |a| {
+                a.copy_text(&target.display().to_string());
+                a.notify("Path copied", false);
+            }
+        }));
+        add("Properties", Some("Alt+Enter"), Box::new({
+            let target = path.clone();
+            move |a| {
+                let entry = Entry::from_path(target.clone(), fs::file_name_of(&target));
+                crate::dialogs::properties_dialog(a, vec![entry]);
+            }
+        }));
+        // Mounted removable media gets its eject action in the same menu.
+        let mount_point = path.clone();
+        if crate::volumes::snapshot()
+            .iter()
+            .any(|v| v.can_eject && v.mount_point.as_deref() == Some(mount_point.as_path()))
+        {
+            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            add("Eject safely", None, Box::new(move |a| a.eject_volume(&mount_point)));
+        }
+        popover.set_child(Some(&list));
+        popover.popup();
+    }
+
     pub fn show_context_menu_at_pointer(self: &Rc<Self>, tab_id: u64, path: &std::path::Path) {
         let anchor: gtk::Widget = self.window.clone().upcast();
         self.show_context_menu(tab_id, &anchor, Some(path.to_path_buf()), 0.0, 0.0);
+    }
+
+    /// Right-click menu for the Home dashboard's empty space. The dashboard is
+    /// an overview rather than a folder, so this menu offers workspace actions
+    /// (open home, terminal, refresh, settings) instead of file operations.
+    pub fn show_dashboard_context_menu(
+        self: &Rc<Self>,
+        anchor: &impl IsA<gtk::Widget>,
+        x: f64,
+        y: f64,
+    ) {
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
+        popover.add_css_class("context-menu");
+        popover.set_parent(anchor);
+        if x > 0.0 || y > 0.0 {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        }
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        list.set_width_request(236);
+        list.add_css_class("context-list");
+        let add = |label: &str, accel: Option<&str>, action: Box<dyn Fn(&Rc<App>)>| {
+            let row = gtk::Button::new();
+            row.add_css_class("flat");
+            let body = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            if let Some(icon_name) = context_icon(label) {
+                let image = gtk::Image::from_icon_name(icon_name);
+                image.set_pixel_size(16);
+                image.add_css_class("context-icon");
+                body.append(&image);
+            }
+            let text = gtk::Label::new(Some(label));
+            text.set_xalign(0.0);
+            text.set_hexpand(true);
+            body.append(&text);
+            if let Some(accel) = accel {
+                let hint = gtk::Label::new(Some(accel));
+                hint.add_css_class("tiny");
+                hint.add_css_class("dim");
+                body.append(&hint);
+            }
+            row.set_child(Some(&body));
+            let weak = Rc::downgrade(self);
+            let popover_ref = popover.clone();
+            row.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    popover_ref.popdown();
+                    action(&app);
+                }
+            });
+            list.append(&row);
+        };
+        add("Open home folder", None, Box::new(|a| {
+            a.navigate_active(Location::Path(crate::paths::home()));
+        }));
+        add("Open home in new tab", None, Box::new(|a| {
+            a.new_tab(Location::Path(crate::paths::home()));
+        }));
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        add("Open in terminal", Some("Ctrl+Shift+E"), Box::new(|a| a.open_terminal()));
+        add("Refresh dashboard", Some("F5"), Box::new(|a| a.refresh_home_dashboard()));
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        add("Settings", None, Box::new(|a| a.open_settings(None)));
+        popover.set_child(Some(&list));
+        popover.popup();
     }
 }
 

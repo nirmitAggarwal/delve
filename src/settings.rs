@@ -352,6 +352,16 @@ impl CwdRule {
     }
 }
 
+/// A user-added application entry for Open with. `command` is an argv template:
+/// `%f` becomes the selected file's path and `%u` its file URI. With neither
+/// placeholder the path is appended as the final argument.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CustomApp {
+    pub label: String,
+    pub command: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -400,6 +410,12 @@ pub struct Settings {
     /// MIME type -> desktop application id, chosen the first time a file of
     /// that type is opened.
     pub default_apps: HashMap<String, String>,
+    /// MIME type -> user-added application commands shown in Open with.
+    #[serde(default)]
+    pub custom_apps: HashMap<String, Vec<CustomApp>>,
+    /// MIME type -> custom command chosen to open that type automatically.
+    #[serde(default)]
+    pub default_commands: HashMap<String, String>,
     pub transfers_enabled: bool,
     pub shortcuts: HashMap<String, String>,
     pub commands: Vec<RunCommand>,
@@ -408,6 +424,9 @@ pub struct Settings {
     pub window_maximized: bool,
     pub recent_locations: Vec<PathBuf>,
     pub recent_files: Vec<PathBuf>,
+    /// Folders the user pinned to the sidebar and the Home dashboard.
+    #[serde(default)]
+    pub pinned: Vec<PathBuf>,
     #[serde(default)]
     pub visits: Vec<VisitStat>,
     pub tips_seen: bool,
@@ -458,6 +477,8 @@ impl Default for Settings {
             text_preview: true,
             terminal: String::new(),
             default_apps: HashMap::new(),
+            custom_apps: HashMap::new(),
+            default_commands: HashMap::new(),
             transfers_enabled: true,
             shortcuts: HashMap::new(),
             commands: Vec::new(),
@@ -466,6 +487,7 @@ impl Default for Settings {
             window_maximized: false,
             recent_locations: Vec::new(),
             recent_files: Vec::new(),
+            pinned: Vec::new(),
             visits: Vec::new(),
             tips_seen: false,
             panned_widths: vec![218, 280],
@@ -545,6 +567,35 @@ impl Settings {
             })
             .collect();
         self.custom_folder_icons = folder_icons;
+        // Keep Open with entries tidy: no empty commands, no duplicates, and a
+        // small cap so the suggestion list stays usable.
+        let mut custom_apps: HashMap<String, Vec<CustomApp>> = HashMap::new();
+        for (mime, list) in std::mem::take(&mut self.custom_apps) {
+            let mime = mime.trim().to_ascii_lowercase();
+            if mime.is_empty() {
+                continue;
+            }
+            let mut kept: Vec<CustomApp> = Vec::new();
+            for mut item in list {
+                item.label = item.label.trim().to_string();
+                item.command = item.command.trim().to_string();
+                if item.command.is_empty()
+                    || kept.iter().any(|k| k.command == item.command)
+                {
+                    continue;
+                }
+                kept.push(item);
+                if kept.len() >= 8 {
+                    break;
+                }
+            }
+            if !kept.is_empty() {
+                custom_apps.insert(mime, kept);
+            }
+        }
+        self.custom_apps = custom_apps;
+        self.default_commands
+            .retain(|mime, command| !mime.trim().is_empty() && !command.trim().is_empty());
         if self.detail_columns.is_empty() {
             self.detail_columns = vec![
                 "name".into(),
@@ -582,6 +633,9 @@ impl Settings {
             }
             command.sync_legacy();
         }
+        self.pinned.retain(|p| p.is_absolute());
+        self.pinned.dedup();
+        self.pinned.truncate(40);
         self.visits.retain(|v| v.path.is_absolute() && v.visits > 0);
         self.visits.sort_by(|a, b| b.visits.cmp(&a.visits));
         self.visits.truncate(200);
@@ -687,6 +741,23 @@ impl Settings {
             .find(|v| v.path == path)
             .map(|v| v.score(now))
             .unwrap_or(0.0)
+    }
+
+    pub fn is_pinned(&self, path: &Path) -> bool {
+        self.pinned.iter().any(|p| p == path)
+    }
+
+    /// Pin or unpin a folder. Only real directories can be pinned.
+    pub fn toggle_pinned(&mut self, path: &Path) -> bool {
+        if self.is_pinned(path) {
+            self.pinned.retain(|p| p != path);
+            false
+        } else if path.is_dir() {
+            self.pinned.push(path.to_path_buf());
+            true
+        } else {
+            false
+        }
     }
 
     pub fn add_recent_file(&mut self, path: &Path) {

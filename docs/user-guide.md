@@ -1,6 +1,6 @@
 # Delve user guide
 
-This guide describes Delve 1.0.0. It covers the interface, file operations,
+This guide describes Delve 1.0.1. It covers the interface, file operations,
 views, command sets, themes, settings, keyboard shortcuts, and the files Delve
 writes on disk.
 
@@ -13,7 +13,7 @@ delve ~/notes.txt     # open the containing folder
 ```
 
 Delve accepts a folder or file path as its startup argument. If the path is a
-file, the containing folder opens. There is no option parser in 1.0.0, so use a
+file, the containing folder opens. There is no option parser in 1.0.1, so use a
 path as the only argument.
 
 Delve uses a single application instance. Launching it again presents the
@@ -103,6 +103,32 @@ position.
 
 Delve records visited folders so frequently used locations can be suggested.
 This history stays in the local settings file.
+
+### Home dashboard
+
+The **Home** sidebar entry opens an overview page, not the contents of your home
+folder. It shows the space used on the volume that holds your home directory, a
+ring chart of that usage, mounted and unmounted volumes, pinned folders, quick
+access to your user folders, and recent places. The ring and cards animate in
+briefly when the page opens.
+
+Use **Open folder** on the dashboard (or the `~` breadcrumb) to browse the real
+`/home/<user>` directory. Home and the real folder are separate pages, so the
+dashboard never gets in the way of normal file management.
+
+### Pinning folders
+
+Right-click a folder in any view, on the location bar, or on a sidebar row and
+choose **Pin to sidebar**. Pinned folders appear in their own sidebar section and
+on the Home dashboard; choose **Unpin from sidebar** to remove them.
+
+### Removable media and partitions
+
+Mounted volumes appear under **System** in the sidebar with their free space in
+the tooltip. Unmounted partitions and pendrives are listed too and mount with one
+click. **Eject safely** is available in the right-click menu of a mounted volume
+and next to it on the Home dashboard. Delve watches the system volume monitor, so
+plugging in a drive updates the sidebar and dashboard immediately.
 
 ## Selecting files
 
@@ -215,9 +241,12 @@ sidecar files into your folders.
 - **Library** — Recent files/locations and Trash.
 - **Network** — detected NFS, CIFS/SMB, SSHFS, DAVFS, rclone, 9p, Ceph, Gluster,
   and AFS mounts. Detection does not imply that the mount is reachable.
-- **System** — filesystem root and detected local mounts.
+- **Pinned** — folders you pinned, in the order you pinned them.
+- **System** — filesystem root, mounted local volumes, and unmounted removable
+  media that can be mounted from Delve.
 
-Mounts come from `/proc/self/mountinfo`; pseudo-filesystems are filtered out.
+Mounts come from GLib's volume monitor and `/proc/self/mountinfo`;
+pseudo-filesystems are filtered out.
 
 ## Search and Quick Spotlight
 
@@ -442,7 +471,7 @@ does not remove your settings, tags, themes, or caches.
 - Reduced-motion desktop settings are respected by GTK's transitions; Delve does
   not add its own animation loop.
 
-## Known limitations in 1.0.0
+## Known limitations in 1.0.1
 
 - LocalSend receiving and TLS certificate pinning are not implemented.
 - Video and PDF previews show file-type icons rather than decoded frames.

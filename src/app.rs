@@ -171,6 +171,9 @@ pub struct Ui {
     pub status_progress: gtk::ProgressBar,
     pub cancel_btn: gtk::Button,
     pub narrow: Cell<bool>,
+    /// The user expanded the sidebar while the window was narrow; keep it open
+    /// until the window widens again or they collapse it themselves.
+    pub sidebar_expanded_narrow: Cell<bool>,
     pub syncing_view_buttons: Cell<bool>,
     pub sidebar_animating: Cell<bool>,
     pub window_title: gtk::Label,
@@ -199,6 +202,8 @@ pub struct App {
     pub drag: RefCell<Option<DragState>>,
     pub thumbs: RefCell<HashMap<PathBuf, Option<PathBuf>>>,
     pub thumb_pending: RefCell<HashSet<PathBuf>>,
+    /// Priority queue feeding the single thumbnail worker.
+    pub thumb_queue: std::sync::Arc<crate::thumbnails::ThumbQueue>,
     pub ui: OnceCell<Ui>,
     pub theme_monitor: RefCell<Option<gio::FileMonitor>>,
     pub op_count: Cell<u32>,
@@ -216,6 +221,8 @@ pub struct App {
     /// True while the Shift+S quick-run prefix is waiting for a digit.
     pub command_prefix: Cell<bool>,
     pub command_prefix_serial: Cell<u64>,
+    /// Letters typed in the file view for jump-to-name navigation.
+    pub quick_prefix: RefCell<(String, std::time::Instant)>,
 }
 
 impl App {
@@ -256,6 +263,7 @@ impl App {
             window.maximize();
         }
 
+        let thumb_queue = crate::thumbnails::ThumbQueue::new();
         let app = Rc::new(App {
             gtk_app,
             window,
@@ -272,6 +280,7 @@ impl App {
             drag: RefCell::new(None),
             thumbs: RefCell::new(HashMap::new()),
             thumb_pending: RefCell::new(HashSet::new()),
+            thumb_queue,
             ui: OnceCell::new(),
             theme_monitor: RefCell::new(None),
             op_count: Cell::new(0),
@@ -283,13 +292,18 @@ impl App {
             runner_popout: RefCell::new(None),
             command_prefix: Cell::new(false),
             command_prefix_serial: Cell::new(0),
+            quick_prefix: RefCell::new((String::new(), std::time::Instant::now())),
         });
+        app.thumb_queue.spawn_workers();
         app.build_ui();
         app.apply_window_opacity();
         crate::dispatch::install(&app);
         app.install_actions();
         app.install_shortcut_tracker();
         app.restart_theme_monitor();
+        // Hot-plugged media must show up immediately in the sidebar and on the
+        // Home dashboard.
+        crate::volumes::start_monitor(&app);
 
         let explicit_path = startup_path.is_some();
         let initial = startup_path.unwrap_or_else(crate::paths::home);
@@ -304,6 +318,17 @@ impl App {
             Location::Home
         };
         app.open_initial(initial);
+        // Coloured folders are rasterised from the theme artwork, which needs a
+        // realised window. Rebuild once the shell is on screen so the first
+        // paint can use the recoloured icons.
+        {
+            let weak = Rc::downgrade(&app);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                if let Some(app) = weak.upgrade() {
+                    app.refresh_after_icon_change();
+                }
+            });
+        }
         app
     }
 
@@ -836,6 +861,7 @@ impl App {
             status_progress,
             cancel_btn,
             narrow: Cell::new(false),
+            sidebar_expanded_narrow: Cell::new(false),
             syncing_view_buttons: Cell::new(false),
             sidebar_animating: Cell::new(false),
             window_title: gtk::Label::new(None),
@@ -1090,6 +1116,29 @@ impl App {
         }
         // Empty-area drop on the canvas stack
         self.install_canvas_drop();
+        self.install_crumb_menu();
+    }
+
+    /// Right-clicking the location bar offers folder actions for the current
+    /// directory (paste, new folder, pin, terminal, properties).
+    fn install_crumb_menu(self: &Rc<Self>) {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        let crumb = self.ui().crumb.clone();
+        let crumb_ref = crumb.clone();
+        gesture.connect_pressed(move |_, _, x, y| {
+            if let Some(app) = weak.upgrade() {
+                let path = app
+                    .active_location()
+                    .path()
+                    .cloned()
+                    .unwrap_or_else(crate::paths::home);
+                app.show_path_context_menu(&crumb_ref, path, x, y);
+            }
+        });
+        crumb.add_controller(gesture);
     }
 
     fn install_window_state(self: &Rc<Self>) {
@@ -1177,6 +1226,19 @@ impl App {
                         }
                     });
                     return glib::Propagation::Stop;
+                }
+                // Letter-based quick select. Only bare letters (optionally
+                // Shift for capitals) reach this point, and never while a text
+                // field has focus, so typing in search or rename is untouched.
+                let plain = !state.intersects(blocking_modifiers);
+                if plain && !app.text_input_focused() {
+                    if let Some(ch) = keyval.to_unicode() {
+                        if (ch.is_alphanumeric() || ch == '_' || ch == '.') && !ch.is_control()
+                        {
+                            app.quick_select(ch);
+                            return glib::Propagation::Stop;
+                        }
+                    }
                 }
             }
             glib::Propagation::Proceed
@@ -1271,6 +1333,15 @@ impl App {
 
     pub fn refresh_sidebar(self: &Rc<Self>) {
         self.ui().sidebar_widget.sync(self);
+    }
+
+    /// Rebuild the Home dashboard in place, e.g. after a volume change.
+    pub fn refresh_home_dashboard(self: &Rc<Self>) {
+        if let Some(tab) = self.active_tab() {
+            if matches!(tab.state.borrow().location, Location::Home) {
+                tab.views.home.sync(self, tab.id);
+            }
+        }
     }
 
     pub fn rebuild_tab_strip(self: &Rc<Self>) {
@@ -1633,24 +1704,55 @@ impl App {
         window.add_css_class(density.css_class());
     }
 
+    /// True when the sidebar is currently drawn as the compact icon rail,
+    /// either because the user chose it or because the window is narrow.
+    pub fn sidebar_is_mini(&self) -> bool {
+        if self.settings.borrow().sidebar_mini {
+            return true;
+        }
+        // The sidebar is built before the rest of the UI exists.
+        match self.ui.get() {
+            Some(ui) => ui.narrow.get() && !ui.sidebar_expanded_narrow.get(),
+            None => false,
+        }
+    }
+
     /// Switch the sidebar between the icon-only rail and the full panel.
     pub fn set_sidebar_mini(self: &Rc<Self>, mini: bool) {
-        if self.settings.borrow().sidebar_mini == mini {
+        if self.settings.borrow().sidebar_mini == mini && !self.ui().narrow.get() {
             return;
         }
         {
             let mut settings = self.settings.borrow_mut();
-            settings.sidebar_mini = mini;
-            settings.save();
+            if settings.sidebar_mini != mini {
+                settings.sidebar_mini = mini;
+                settings.save();
+            }
         }
-        self.ui().sidebar_widget.set_mini(self, mini);
-        if !self.ui().narrow.get() {
-            let width = if mini {
-                60
-            } else {
-                self.settings.borrow().sidebar_width
-            };
+        // An explicit action in a narrow window wins over the automatic rail.
+        self.ui()
+            .sidebar_expanded_narrow
+            .set(self.ui().narrow.get() && !mini);
+        self.ui().sidebar_widget.apply_mini(self, self.sidebar_is_mini());
+        let width = self.sidebar_width_for_window(self.window.width(), mini);
+        if self.ui().narrow.get() {
+            self.ui().outer_paned.set_position(width);
+        } else {
             self.animate_sidebar_width(width);
+        }
+    }
+
+    /// Sidebar width for the current window: full width on wide windows, and
+    /// clamped so the content pane keeps most of a narrow window.
+    fn sidebar_width_for_window(&self, window_width: i32, mini: bool) -> i32 {
+        if mini {
+            return 60;
+        }
+        let saved = self.settings.borrow().sidebar_width.max(190);
+        if self.ui().narrow.get() {
+            saved.min((window_width / 3).max(150))
+        } else {
+            saved
         }
     }
 
@@ -1815,21 +1917,43 @@ impl App {
         let narrow = width < 900;
         let settings = self.settings.borrow().clone();
         let ui = self.ui();
+        let was_narrow = ui.narrow.get();
+        ui.narrow.set(narrow);
+        if !narrow {
+            ui.sidebar_expanded_narrow.set(false);
+        }
 
         // The sidebar is never fully collapsible: it stays in the splitter,
-        // either as the full panel or as the compact icon rail.
+        // either as the full panel or as the compact icon rail. In a narrow
+        // window the rail is automatic so the content pane keeps its room.
         let sidebar_parent: gtk::Widget = ui.outer_paned.clone().upcast();
         if ui.sidebar_widget.root.parent().as_ref() != Some(&sidebar_parent) {
             ui.outer_paned.set_start_child(Some(&ui.sidebar_widget.root));
         }
         ui.sidebar_widget.root.set_visible(true);
-        ui.outer_paned.set_position(if settings.sidebar_mini {
-            60
-        } else {
-            settings.sidebar_width.max(190)
-        });
+        let mini = self.sidebar_is_mini();
+        ui.sidebar_widget.apply_mini(self, mini);
+        ui.outer_paned
+            .set_position(self.sidebar_width_for_window(width, mini));
 
-        if narrow == ui.narrow.get() {
+        // Trim the command bar on narrow windows. The same actions stay
+        // available from the More menu and their keyboard shortcuts.
+        let compact = width < 980;
+        for button in [
+            &ui.cmd_cut,
+            &ui.cmd_copy,
+            &ui.cmd_paste,
+            &ui.cmd_rename,
+            &ui.cmd_trash,
+        ] {
+            button.set_visible(!compact);
+        }
+        let tight = width < 780;
+        ui.cmd_undo.set_visible(!tight);
+        ui.cmd_redo.set_visible(!tight);
+        ui.view_btn_label.set_visible(width >= 760);
+
+        if narrow == was_narrow {
             ui.inspector_btn.set_visible(true);
             ui.inspector_widget.root.set_visible(settings.inspector_visible || narrow);
             if !narrow && settings.inspector_visible {
@@ -1841,7 +1965,6 @@ impl App {
             }
             return;
         }
-        ui.narrow.set(narrow);
         if narrow {
             ui.inner_paned.set_end_child(None::<&gtk::Widget>);
             let right_parent: gtk::Widget = ui.drawer_right_box.clone().upcast();

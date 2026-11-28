@@ -124,6 +124,35 @@ install -m 0644 "$METAINFO" "$DATA_DIR/metainfo/$APP_ID.metainfo.xml"
 cp -a "$ICONS/hicolor/." "$ICON_DIR/hicolor/"
 cp -a "$ICONS/Delve/." "$ICON_DIR/Delve/"
 
+# The raster PNG sizes are checked into the source tree and desktop shells
+# prefer them over the scalable SVG, so editing assets/delve.svg alone used to
+# leave an old icon installed. Re-render the PNGs from the SVG that ship for
+# this build, so a new logo always reaches the desktop.
+APP_SVG="$ROOT/assets/delve.svg"
+if [[ -f "$APP_SVG" ]]; then
+  if command -v rsvg-convert >/dev/null 2>&1; then
+    for size in 16 24 32 48 64 128 256 512; do
+      dir="$ICON_DIR/hicolor/${size}x${size}/apps"
+      install -d "$dir"
+      rsvg-convert -w "$size" -h "$size" "$APP_SVG" -o "$dir/$APP_ID.png"
+    done
+    install -m 0644 "$APP_SVG" "$ICON_DIR/hicolor/scalable/apps/$APP_ID.svg"
+    install -m 0644 "$APP_SVG" "$ICON_DIR/Delve/scalable/apps/$APP_ID.svg"
+  else
+    newest_svg="$(stat -c %Y "$APP_SVG" 2>/dev/null || echo 0)"
+    newest_png=0
+    while IFS= read -r png; do
+      stamp="$(stat -c %Y "$png" 2>/dev/null || echo 0)"
+      [[ "$stamp" -gt "$newest_png" ]] && newest_png="$stamp"
+    done < <(find "$ICON_DIR/hicolor" -name "$APP_ID.png" -type f 2>/dev/null)
+    if [[ "$newest_svg" -gt "$newest_png" ]]; then
+      echo "Warning: rsvg-convert is missing and the installed PNG icons are" >&2
+      echo "older than assets/delve.svg. Install librsvg2-bin and re-run, or" >&2
+      echo "your desktop may keep showing the previous icon." >&2
+    fi
+  fi
+fi
+
 if [[ -d "$DOCS" ]]; then
   cp -a "$DOCS/." "$DOC_DIR/docs/"
 fi
@@ -161,9 +190,13 @@ if [[ -z "$DESTDIR" ]]; then
     fi
   done
   if [[ -n "$icon_cache" ]]; then
+    # `-f` overwrites the cache even when timestamps look unchanged, which is
+    # exactly what a replaced icon needs.
     "$icon_cache" -q -t -f "$ICON_DIR/hicolor" >/dev/null 2>&1 || true
     "$icon_cache" -q -t -f "$ICON_DIR/Delve" >/dev/null 2>&1 || true
   fi
+  # Some shells cache the icon by directory mtime as well.
+  touch "$ICON_DIR/hicolor" "$ICON_DIR/hicolor/scalable/apps" 2>/dev/null || true
 fi
 
 echo

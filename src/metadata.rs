@@ -39,10 +39,26 @@ pub const TAG_ICONS: &[(&str, &str)] = &[
     ("network-workgroup-symbolic", "Work"),
 ];
 
+/// Paths are written as lossy UTF-8. `PathBuf`'s own serde form refuses
+/// non-UTF-8 paths, which used to make the whole database fail to serialize
+/// (and therefore silently skip saving) when a single such file was tagged.
+mod path_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&path.to_string_lossy())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        Ok(PathBuf::from(String::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ItemMeta {
     /// Last known path, used for display and for stale-entry detection.
-    #[serde(default)]
+    #[serde(default, with = "path_serde")]
     pub path: PathBuf,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -108,10 +124,20 @@ impl Metadata {
         let file = crate::paths::metadata_file();
         let _ = std::fs::create_dir_all(crate::paths::data_dir());
         let tmp = file.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &file).is_err() {
-                let _ = std::fs::remove_file(&tmp);
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(json) => json,
+            Err(err) => {
+                crate::util::log(&format!("Could not serialise metadata ({err}); changes not saved"));
+                return;
             }
+        };
+        if let Err(err) = std::fs::write(&tmp, json) {
+            crate::util::log(&format!("Could not write metadata ({err})"));
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &file) {
+            crate::util::log(&format!("Could not replace metadata database ({err})"));
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 

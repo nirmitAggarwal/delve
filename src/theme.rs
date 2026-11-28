@@ -773,7 +773,7 @@ popover > contents {
 impl Theme {
     /// Full stylesheet for the component provider.
     pub fn css(&self) -> String {
-        base_css(&self.spec)
+        format!("{}\n{}", base_css(&self.spec), dashboard_css())
     }
 
     /// Base directory for live-reload watching.
@@ -1172,6 +1172,57 @@ pub fn list_custom_themes() -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// Home dashboard styling. Colours come from the theme tokens, so every
+/// built-in and custom theme keeps readable cards and rings.
+fn dashboard_css() -> &'static str {
+    r#"
+.dash-card {
+  background-color: alpha(@floating_bg, 0.55);
+  border: 1px solid @border_subtle;
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+.dash-tile {
+  background-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 0;
+}
+.dash-tile:hover {
+  background-color: @hover_bg;
+  border-color: @border_subtle;
+}
+.dash-row {
+  background-color: transparent;
+  border-radius: 9px;
+  padding: 5px 8px;
+}
+.dash-row:hover {
+  background-color: @hover_bg;
+}
+.dash-bar {
+  min-height: 5px;
+  min-width: 48px;
+  margin-top: 2px;
+}
+.dash-bar trough {
+  min-height: 5px;
+  border-radius: 4px;
+  background-color: alpha(@text_muted, 0.20);
+  border: none;
+}
+.dash-bar progress {
+  border-radius: 4px;
+  background-color: @accent;
+  border: none;
+}
+.sidebar-row.unmounted-volume label,
+.sidebar-row.unmounted-volume image {
+  opacity: 0.72;
+}
+"#
 }
 
 pub fn density_class(density: Density) -> &'static str {

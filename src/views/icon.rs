@@ -57,6 +57,9 @@ impl IconView {
         rubber_area.set_can_target(false);
 
         let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        // The placeholder is decoration only: clicks must fall through to the
+        // canvas so an empty folder still answers right-click.
+        empty.set_can_target(false);
         empty.set_valign(gtk::Align::Center);
         empty.set_halign(gtk::Align::Center);
         empty.add_css_class("delve-empty");
@@ -64,9 +67,11 @@ impl IconView {
         let empty_icon = gtk::Image::from_icon_name("folder-open-symbolic");
         empty_icon.set_pixel_size(40);
         empty_icon.set_opacity(0.55);
+        empty_icon.set_can_target(false);
         empty.append(&empty_icon);
         let empty_label = gtk::Label::new(Some("This folder is empty"));
         empty_label.add_css_class("delve-empty");
+        empty_label.set_can_target(false);
         empty.append(&empty_label);
         let empty_label_for_state = empty_label.clone();
 
@@ -133,31 +138,39 @@ impl IconView {
         }
 
         // --- Context menus --------------------------------------------------
+        // The gesture lives on the scroller rather than the grid: a GtkFlowBox
+        // is only as tall as its rows, so right-clicking the canvas below the
+        // last row never reached a gesture attached to the grid itself.
         {
             let gesture = gtk::GestureClick::new();
             gesture.set_button(3);
             let flow_ref = flow.clone();
+            let scroller_ref = scroller.clone();
             let paths_entries = entries.clone();
             let strong = Rc::downgrade(app);
             gesture.connect_pressed(move |_, _, x, y| {
-                let child = flow_ref.child_at_pos(x as i32, y as i32);
-                let path = child.as_ref().and_then(|c| {
-                    let idx = c.index();
-                    paths_entries.borrow().get(idx.max(0) as usize).map(|e| e.path.clone())
+                let Some(app) = strong.upgrade() else { return };
+                let idx = flow_point(&flow_ref, &scroller_ref, x, y)
+                    .and_then(|(fx, fy)| tile_index_at(&flow_ref, fx, fy));
+                let path = idx.and_then(|idx| {
+                    paths_entries
+                        .borrow()
+                        .get(idx.max(0) as usize)
+                        .map(|e| e.path.clone())
                 });
                 if let Some(path) = &path {
-                    if let Some(app) = strong.upgrade() {
-                        if !app.tab_selection(tab_id).contains(path) {
-                            app.set_selection(tab_id, vec![path.clone()], Some(path.clone()));
-                        }
+                    if !app.tab_selection(tab_id).contains(path) {
+                        app.set_selection(tab_id, vec![path.clone()], Some(path.clone()));
                     }
+                } else {
+                    // Blank canvas: offer folder actions instead of a menu for
+                    // a selection the user did not right-click on.
+                    app.set_selection(tab_id, Vec::new(), None);
                 }
-                if let Some(app) = strong.upgrade() {
-                    let anchor: gtk::Widget = flow_ref.clone().upcast();
-                    app.show_context_menu(tab_id, &anchor, path, x, y);
-                }
+                let anchor: gtk::Widget = scroller_ref.clone().upcast();
+                app.show_context_menu(tab_id, &anchor, path, x, y);
             });
-            flow.add_controller(gesture);
+            scroller.add_controller(gesture);
         }
 
         // --- Click on empty space clears the selection ----------------------
@@ -169,12 +182,9 @@ impl IconView {
             gesture.set_button(1);
             gesture.connect_released(move |_, _, x, y| {
                 let Some(app) = strong.upgrade() else { return };
-                let origin = flow_probe
-                    .compute_point(&scroller_probe, &gtk::graphene::Point::new(0.0, 0.0))
-                    .unwrap_or_default();
-                let fx = x - origin.x() as f64;
-                let fy = y - origin.y() as f64;
-                if flow_probe.child_at_pos(fx as i32, fy as i32).is_none() {
+                let hit = flow_point(&flow_probe, &scroller_probe, x, y)
+                    .and_then(|(fx, fy)| tile_index_at(&flow_probe, fx, fy));
+                if hit.is_none() {
                     app.set_selection(tab_id, Vec::new(), None);
                 }
             });
@@ -246,13 +256,11 @@ impl IconView {
             let rect_begin = rubber_rect.clone();
             let area_begin = rubber_area.clone();
             gesture.connect_drag_begin(move |g, x, y| {
-                // Dragging a cell is drag and drop, not rubber-band selection.
-                let origin = flow_probe
-                    .compute_point(&scroller_probe, &gtk::graphene::Point::new(0.0, 0.0))
-                    .unwrap_or_default();
-                let fx = x - origin.x() as f64;
-                let fy = y - origin.y() as f64;
-                if flow_probe.child_at_pos(fx as i32, fy as i32).is_some() {
+                // Dragging an actual tile is drag and drop, not rubber-band
+                // selection; the padding around a tile still rubber-bands.
+                let hit = flow_point(&flow_probe, &scroller_probe, x, y)
+                    .and_then(|(fx, fy)| tile_index_at(&flow_probe, fx, fy));
+                if hit.is_some() {
                     g.set_state(gtk::EventSequenceState::Denied);
                     return;
                 }
@@ -336,6 +344,53 @@ impl IconView {
             scroller.add_controller(gesture);
         }
 
+        // Scrolling reveals new cells; queue their previews as they appear so
+        // the visible screenful is never behind the rest of the folder.
+        {
+            let strong = Rc::downgrade(app);
+            let scroller_ref = scroller.clone();
+            let flow_ref = flow.clone();
+            let entries_ref = entries.clone();
+            let scheduled = Rc::new(Cell::new(false));
+            let request_scan = {
+                let scheduled = scheduled.clone();
+                let strong = strong.clone();
+                let scroller = scroller_ref.clone();
+                let flow = flow_ref.clone();
+                let entries = entries_ref.clone();
+                Rc::new(move || {
+                    if scheduled.replace(true) {
+                        return;
+                    }
+                    let scheduled = scheduled.clone();
+                    let strong = strong.clone();
+                    let scroller = scroller.clone();
+                    let flow = flow.clone();
+                    let entries = entries.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(60),
+                        move || {
+                            scheduled.set(false);
+                            if let Some(app) = strong.upgrade() {
+                                queue_visible_thumbnails(&app, &scroller, &flow, &entries);
+                            }
+                        },
+                    );
+                })
+            };
+            let vadj = scroller.vadjustment();
+            {
+                let scan = request_scan.clone();
+                vadj.connect_value_changed(move |_| scan());
+            }
+            {
+                // Fires when the viewport size (and therefore the visible set)
+                // changes, for example after the first allocation or a resize.
+                let scan = request_scan.clone();
+                vadj.connect_changed(move |_| scan());
+            }
+        }
+
         IconView {
             scroller,
             flow,
@@ -345,6 +400,31 @@ impl IconView {
             entries,
             images,
             syncing,
+        }
+    }
+
+    /// Bring a path into view after a quick-select jump.
+    pub fn reveal(&self, path: &std::path::Path) {
+        let index = {
+            let entries = self.entries.borrow();
+            entries.iter().position(|e| e.path == path)
+        };
+        let Some(index) = index else { return };
+        let mut child = self.flow.first_child();
+        let mut current = 0;
+        while let Some(c) = child {
+            if let Some(cell) = c.downcast_ref::<gtk::FlowBoxChild>() {
+                if cell.index() == index as i32 {
+                    self.flow.select_child(cell);
+                    // Focus scrolls the child into view, including below the
+                    // fold; the grid handles overscroll itself.
+                    cell.grab_focus();
+                    return;
+                }
+            }
+            child = c.next_sibling();
+            current += 1;
+            let _ = current;
         }
     }
 
@@ -413,9 +493,17 @@ impl IconView {
         }
         self.syncing.set(false);
 
-        // Thumbnails: apply cached images immediately, then generate the rest.
+        // Thumbnails: apply cached images immediately, then generate previews
+        // only for the cells the user can actually see.
         self.apply_thumbnails(app);
-        super::queue_icons(app, &entries, icon_size);
+        let (scroller, flow) = (self.scroller.clone(), self.flow.clone());
+        let paths = self.entries.clone();
+        let strong = Rc::downgrade(app);
+        glib::idle_add_local_once(move || {
+            if let Some(app) = strong.upgrade() {
+                queue_visible_thumbnails(&app, &scroller, &flow, &paths);
+            }
+        });
     }
 
     fn build_cell(
@@ -523,30 +611,9 @@ impl IconView {
         }
         child.set_focusable(true);
 
-        // Selection shortcut: single click selects (already handled by FlowBox).
-        let gesture = gtk::GestureClick::new();
-        let strong = Rc::downgrade(app);
-        let path = entry.path.clone();
-        let child_ref = child.clone();
-        gesture.connect_released(move |g, _, _, _| {
-            if g.current_button() != 1 {
-                return;
-            }
-            let state = g.current_event().map(|e| e.modifier_state()).unwrap_or(gdk::ModifierType::empty());
-            let Some(app) = strong.upgrade() else { return };
-            if state.contains(gdk::ModifierType::SHIFT_MASK) {
-                app.extend_selection_to(tab_id, &path);
-            } else if state.contains(gdk::ModifierType::CONTROL_MASK) {
-                app.toggle_selection(tab_id, &path);
-            } else {
-                let current = app.tab_selection(tab_id);
-                if current.len() > 1 && current.contains(&path) {
-                    app.set_selection(tab_id, vec![path.clone()], Some(path.clone()));
-                }
-            }
-            let _ = &child_ref;
-        });
-        child.add_controller(gesture);
+        // Click selection (plain, Ctrl-toggle and Shift-range) is handled by
+        // GtkFlowBox itself. A second gesture here toggled the same child a
+        // second time, so Ctrl+click ended up undoing its own selection.
         child
     }
 
@@ -566,10 +633,13 @@ impl IconView {
             let Some(holder) = weak.upgrade().and_then(|w| w.downcast::<gtk::Box>().ok()) else {
                 continue;
             };
-            // Already showing a thumbnail: never re-decode it.
+            // Already showing a thumbnail: never re-decode or re-fade it. The
+            // check has to match what is appended below (a GtkImage); looking
+            // for a GtkPicture never matched, so every pass reset the same
+            // cells to the start of their fade and left them blank.
             if holder
                 .first_child()
-                .map(|c| c.is::<gtk::Picture>())
+                .map(|c| c.has_css_class("thumb-image"))
                 .unwrap_or(false)
             {
                 continue;
@@ -588,6 +658,7 @@ impl IconView {
             // size cannot grow the cell when the source photo is very tall or
             // wide, which is what keeps the grid perfectly uniform.
             let pic = gtk::Image::from_paintable(Some(&texture));
+            pic.add_css_class("thumb-image");
             pic.set_pixel_size(icon_size);
             pic.set_halign(gtk::Align::Center);
             pic.set_valign(gtk::Align::Center);
@@ -663,7 +734,74 @@ impl IconView {
     }
 }
 
+/// Queue previews for the cells currently inside (or one screen around) the
+/// viewport. Off-screen files are never decoded, so opening a folder of
+/// thousands of photos no longer spends minutes generating previews nobody
+/// asked to see.
+fn queue_visible_thumbnails(
+    app: &Rc<App>,
+    scroller: &gtk::ScrolledWindow,
+    flow: &gtk::FlowBox,
+    entries: &Rc<RefCell<Vec<Entry>>>,
+) {
+    if !app.settings.borrow().thumbnails {
+        return;
+    }
+    let size = app.settings.borrow().icon_size.max(24) as u32;
+    let vadj = scroller.vadjustment();
+    let page = vadj.page_size().max(1.0);
+    // The visible area plus a single row below it: enough to make scrolling
+    // feel instant without decoding a whole (potentially huge) folder.
+    let lookahead = (app.settings.borrow().icon_size.max(24) + 64) as f64;
+    let top = vadj.value();
+    let bottom = vadj.value() + page + lookahead;
+    let mut jobs: Vec<(PathBuf, Entry)> = Vec::new();
+    let mut child = flow.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        if let Some(bounds) = c.compute_bounds(scroller) {
+            let y = bounds.y() as f64;
+            let h = bounds.height() as f64;
+            if y + h >= top && y <= bottom {
+                if let Some(cell) = c.downcast_ref::<gtk::FlowBoxChild>() {
+                    let idx = cell.index();
+                    if idx >= 0 {
+                        if let Some(entry) = entries.borrow().get(idx as usize) {
+                            if super::wants_thumbnail(app, entry) {
+                                jobs.push((entry.path.clone(), entry.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        child = next;
+    }
+    if jobs.is_empty() && (flow.width() == 0 || flow.height() == 0) {
+        // Before the first allocation there are no cell bounds to test. Queue
+        // one screenful at the lower priority; the size-change handler scans
+        // the real viewport once the grid is laid out.
+        let list = entries.borrow();
+        jobs = list
+            .iter()
+            .filter(|e| super::wants_thumbnail(app, e))
+            .take(24)
+            .map(|e| (e.path.clone(), e.clone()))
+            .collect();
+        app.queue_thumbnails(jobs, size);
+        return;
+    }
+    if !jobs.is_empty() {
+        app.queue_visible_thumbnails(jobs, size);
+    }
+}
+
 /// Fade a freshly applied thumbnail in so previews do not flash into place.
+///
+/// Tick callbacks only run while the window is producing frames. When the app is
+/// in the background (or the frame clock is throttled) a preview could otherwise
+/// stay at opacity 0 and look like a failed thumbnail, so a timeout guarantees
+/// the final state.
 fn fade_in(widget: &impl IsA<gtk::Widget>) {
     let widget: gtk::Widget = widget.clone().upcast();
     widget.set_opacity(0.0);
@@ -677,6 +815,42 @@ fn fade_in(widget: &impl IsA<gtk::Widget>) {
             glib::ControlFlow::Continue
         }
     });
+    let widget = widget.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+        widget.set_opacity(1.0);
+    });
+}
+
+/// Translate scroller-relative pointer coordinates into grid coordinates.
+fn flow_point(
+    flow: &gtk::FlowBox,
+    scroller: &gtk::ScrolledWindow,
+    x: f64,
+    y: f64,
+) -> Option<(f64, f64)> {
+    let origin = flow.compute_point(scroller, &gtk::graphene::Point::new(0.0, 0.0))?;
+    Some((x - origin.x() as f64, y - origin.y() as f64))
+}
+
+/// Index of the tile whose visible card is under the point (grid coordinates).
+///
+/// GtkFlowBox stretches each child across a whole column, so a child's bounds
+/// can be far wider than the icon card drawn inside it. Testing the card keeps
+/// clicks in the gaps between icons from selecting - or right-clicking - a
+/// neighbour, and lets the empty canvas fall through to folder actions.
+fn tile_index_at(flow: &gtk::FlowBox, x: f64, y: f64) -> Option<i32> {
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let child = flow.child_at_pos(x as i32, y as i32)?;
+    let bounds = child.child()?.compute_bounds(flow)?;
+    let (tx, ty) = (bounds.x() as f64, bounds.y() as f64);
+    if x >= tx && x <= tx + bounds.width() as f64 && y >= ty && y <= ty + bounds.height() as f64
+    {
+        Some(child.index())
+    } else {
+        None
+    }
 }
 
 fn gdk_actions() -> gtk::gdk::DragAction {

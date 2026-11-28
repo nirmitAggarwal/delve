@@ -125,7 +125,7 @@ impl Location {
 
     pub fn subtitle(&self) -> String {
         match self {
-            Location::Home => "Quick access to your folders".into(),
+            Location::Home => "Overview of your space and places".into(),
             Location::Path(p) => crate::paths::display_path(p),
             Location::Search { root, recursive, .. } => {
                 format!(

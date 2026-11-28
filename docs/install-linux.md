@@ -65,8 +65,8 @@ extract:
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf delve-1.0.0-linux-x86_64.tar.gz
-cd delve-1.0.0-linux-x86_64
+tar -xzf delve-1.0.1-linux-x86_64.tar.gz
+cd delve-1.0.1-linux-x86_64
 ```
 
 The checksum file must list the exact tarball name. If it does not, download both
@@ -203,6 +203,31 @@ cargo run -- ~/Downloads
 
    Replace `gtk4-update-icon-cache` with `gtk-update-icon-cache` if that is the
    name on your system.
+
+## Native packages
+
+Release 1.0.1 ships native packages in addition to the tarball. They declare
+their runtime dependencies, so the package manager installs GTK 4.10+ for you,
+and they include the complete bundled Delve icon theme, so no separate icon
+package is required.
+
+| Distribution | Package file |
+| --- | --- |
+| Debian / Ubuntu | `delve_1.0.1_amd64.deb` |
+| Fedora / RHEL | `delve-1.0.1-1.x86_64.rpm` |
+| Arch Linux | `delve-1.0.1-1-x86_64.pkg.tar.zst` |
+
+```sh
+sudo dpkg -i delve_1.0.1_amd64.deb
+sudo dnf install ./delve-1.0.1-1.x86_64.rpm
+sudo pacman -U ./delve-1.0.1-1-x86_64.pkg.tar.zst
+```
+
+The package's post-install script refreshes the desktop database and icon
+caches. Users can still switch the icon theme in **Settings → Icons & theme**.
+
+To build the packages yourself from a release tarball, see
+`docs/build-and-release.md` and `packaging/README.md`.
 
 ## Uninstall
 

@@ -17,7 +17,7 @@ It is distribution-neutral. Delve does not depend on GNOME, KDE, Hyprland, DMS,
 a particular icon pack, terminal, or desktop shell CSS. It needs GTK 4.10 or
 newer and a normal XDG desktop.
 
-**Current release: 1.0.0.** The interface icons are bundled inside the binary,
+**Current release: 1.0.1.** The interface icons are bundled inside the binary,
 so Delve works offline and on minimal systems without an icon package.
 
 ## Install
@@ -27,8 +27,8 @@ checksum, then install:
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf delve-1.0.0-linux-x86_64.tar.gz
-cd delve-1.0.0-linux-x86_64
+tar -xzf delve-1.0.1-linux-x86_64.tar.gz
+cd delve-1.0.1-linux-x86_64
 
 sudo ./install.sh          # system-wide, /usr/local
 ./install.sh --user        # per-user, ~/.local
@@ -39,6 +39,20 @@ application icon size, the bundled icon theme, and documentation. It updates
 desktop and icon caches when the tools are present. See
 [Install on Linux](docs/install-linux.md) for prefixes, staged installs,
 uninstalling, and troubleshooting.
+
+### Native packages
+
+Release 1.0.1 also ships native packages that pull in GTK 4.10+ and include the
+complete bundled icon theme, so no separate icon package is needed:
+
+```sh
+sudo dpkg -i delve_1.0.1_amd64.deb          # Debian / Ubuntu
+sudo dnf install ./delve-1.0.1-1.x86_64.rpm  # Fedora / RHEL
+sudo pacman -U ./delve-1.0.1-1-x86_64.pkg.tar.zst  # Arch Linux
+```
+
+See [Install on Linux](docs/install-linux.md) for the full dependency list and
+how to build them from the release tarball.
 
 ### Build from source
 

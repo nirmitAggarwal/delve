@@ -3,6 +3,7 @@
 
 pub mod detail;
 pub mod graph;
+pub mod home;
 pub mod icon;
 pub mod recursive;
 pub mod treemap;
@@ -11,14 +12,18 @@ use crate::app::App;
 use crate::fs::Entry;
 use crate::settings::ViewKind;
 use gtk4 as gtk;
+use gtk4::gdk::prelude::PaintableExt as _;
 use gtk4::glib;
+use gtk4::gsk::prelude::GskRendererExt as _;
 use gtk4::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 pub struct Views {
     pub stack: gtk::Stack,
+    pub home: home::HomeView,
     pub icon: icon::IconView,
     pub detail: detail::DetailView,
     pub recursive: recursive::RecursiveView,
@@ -28,6 +33,7 @@ pub struct Views {
 
 impl Views {
     pub fn new(app: &Rc<App>, tab_id: u64) -> Views {
+        let home = home::HomeView::new(app);
         let icon = icon::IconView::new(app, tab_id);
         let detail = detail::DetailView::new(app, tab_id);
         let recursive = recursive::RecursiveView::new(app, tab_id);
@@ -39,13 +45,26 @@ impl Views {
             .vexpand(true)
             .hexpand(true)
             .build();
+        stack.add_named(&home.root, Some("home"));
         stack.add_named(&icon.overlay, Some("icon"));
         stack.add_named(&detail.scroller, Some("detail"));
         stack.add_named(&recursive.root, Some("recursive"));
         stack.add_named(&treemap.root, Some("treemap"));
         stack.add_named(&graph.root, Some("graph"));
         icon.install_drop(app, tab_id);
-        Views { stack, icon, detail, recursive, treemap, graph }
+        Views { stack, home, icon, detail, recursive, treemap, graph }
+    }
+
+    /// The dashboard is a page of its own, not a folder listing.
+    pub fn show_home(&self) {
+        self.stack.set_visible_child_name("home");
+    }
+
+    /// Select and scroll to a path for quick-select navigation.
+    pub fn reveal(&self, path: &Path) {
+        if self.stack.visible_child_name().as_deref() == Some("icon") {
+            self.icon.reveal(path);
+        }
     }
 
     pub fn show(&self, kind: ViewKind) {
@@ -65,6 +84,7 @@ impl Views {
             Some("recursive") => ViewKind::Recursive,
             Some("treemap") => ViewKind::Treemap,
             Some("graph") => ViewKind::Graph,
+            Some("home") => ViewKind::Icon,
             _ => ViewKind::Icon,
         }
     }
@@ -104,6 +124,96 @@ pub fn folder_icon_name(entry: &Entry) -> &'static str {
     "folder"
 }
 
+thread_local! {
+    /// Recoloured folder artwork, keyed by (theme, icon, size, colour).
+    static TINTED_FOLDERS: RefCell<HashMap<(String, String, i32, String), gtk::gdk::Texture>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The symbolic counterpart of a place-specific folder glyph.
+fn symbolic_glyph(name: &str) -> String {
+    if name.ends_with("-symbolic") {
+        name.to_string()
+    } else {
+        format!("{name}-symbolic")
+    }
+}
+
+/// Render a folder icon in a custom colour without changing its artwork.
+///
+/// The theme icon is rasterised once, its shading is kept and its hue is
+/// replaced by the folder colour, so a Documents folder still reads as the
+/// Documents folder. Until a renderer is available (before the window is
+/// realised) the same glyph's symbolic form is used as a fallback.
+pub fn folder_color_image(app: &App, entry: &Entry, pixel_size: i32, color: &str) -> gtk::Image {
+    let name = folder_icon_name(entry);
+    if let Some(texture) = tinted_folder_texture(app, name, pixel_size, color) {
+        let image = gtk::Image::from_paintable(Some(&texture));
+        image.set_pixel_size(pixel_size);
+        return image;
+    }
+    gtk::Image::from_icon_name(&symbolic_glyph(name))
+}
+
+fn tinted_folder_texture(
+    app: &App,
+    name: &str,
+    pixel_size: i32,
+    color: &str,
+) -> Option<gtk::gdk::Texture> {
+    let (r, g, b, _) = crate::util::parse_color(color)?;
+    let key = (
+        app.settings.borrow().icon_theme.clone(),
+        name.to_string(),
+        pixel_size,
+        color.to_ascii_lowercase(),
+    );
+    if let Some(texture) = TINTED_FOLDERS.with(|cache| cache.borrow().get(&key).cloned()) {
+        return Some(texture);
+    }
+    let display = gtk::gdk::Display::default()?;
+    let renderer = app.window.renderer()?;
+    let theme = gtk::IconTheme::for_display(&display);
+    let paintable = theme.lookup_icon(
+        name,
+        &[],
+        pixel_size,
+        1,
+        gtk::TextDirection::None,
+        gtk::IconLookupFlags::empty(),
+    );
+    let edge = pixel_size as f64;
+    let snapshot = gtk::Snapshot::new();
+    paintable.snapshot(&snapshot, edge, edge);
+    let node = snapshot.to_node()?;
+    let rect = gtk::graphene::Rect::new(0.0, 0.0, edge as f32, edge as f32);
+    let texture = renderer.render_texture(&node, Some(&rect));
+    let encoded = texture.save_to_png_bytes();
+    let mut image = image::load_from_memory(&encoded).ok()?.to_rgba8();
+    for pixel in image.pixels_mut() {
+        let p = &mut pixel.0;
+        if p[3] == 0 {
+            continue;
+        }
+        // Keep each pixel's lightness so folder shading survives the recolour.
+        let lum = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0;
+        let shade = 0.30 + 0.85 * lum;
+        p[0] = (r as f32 * shade).min(255.0) as u8;
+        p[1] = (g as f32 * shade).min(255.0) as u8;
+        p[2] = (b as f32 * shade).min(255.0) as u8;
+    }
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    let bytes = glib::Bytes::from(&png);
+    let texture = gtk::gdk::Texture::from_bytes(&bytes).ok()?;
+    TINTED_FOLDERS.with(|cache| {
+        cache.borrow_mut().insert(key, texture.clone());
+    });
+    Some(texture)
+}
+
 /// Return the configured custom icon source for an entry, if any. Folder rules
 /// match the folder colour, while file rules match MIME type or extension.
 pub fn custom_icon_source(app: &App, entry: &Entry) -> Option<String> {
@@ -136,10 +246,10 @@ pub fn entry_icon(app: &App, entry: &Entry, pixel_size: i32) -> gtk::Image {
     let image = if let Some(image) = custom_image {
         image
     } else if entry.is_dir {
-        if app.meta.borrow().folder_color(&entry.path).is_some() {
-            // Custom folder colours are applied as a tint over the symbolic
-            // icon so they work with every icon theme.
-            gtk::Image::from_icon_name("folder-symbolic")
+        if let Some(color) = app.meta.borrow().folder_color(&entry.path) {
+            // Recolour the folder's own theme artwork rather than substituting
+            // a generic outlined folder, which looked like a different icon.
+            folder_color_image(app, entry, pixel_size, &color)
         } else {
             gtk::Image::from_icon_name(folder_icon_name(entry))
         }
@@ -174,28 +284,14 @@ pub fn entry_icon(app: &App, entry: &Entry, pixel_size: i32) -> gtk::Image {
     image
 }
 
-pub fn tag_summary(app: &App, path: &Path) -> String {
-    let meta = app.meta.borrow();
+pub fn tag_summary(app: &App, path: &Path) -> String {    let meta = app.meta.borrow();
     let names = meta.tag_names_for(path);
     names.join(", ")
 }
 
-/// Queue asynchronous thumbnail generation for icon cells.
-pub fn queue_icons(app: &Rc<App>, entries: &[Entry], size: i32) {
-    if !app.settings.borrow().thumbnails {
-        return;
-    }
-    let jobs: Vec<(PathBuf, Entry)> = entries
-        .iter()
-        .filter(|e| !has_custom_icon(app, e))
-        .filter(|e| e.is_image() || e.is_video() || e.is_pdf())
-        .take(800)
-        .map(|e| (e.path.clone(), e.clone()))
-        .collect();
-    if jobs.is_empty() {
-        return;
-    }
-    app.queue_thumbnails(jobs, size.max(32) as u32);
+/// True when an entry can show a preview instead of its file icon.
+pub fn wants_thumbnail(app: &App, entry: &Entry) -> bool {
+    !has_custom_icon(app, entry) && (entry.is_image() || entry.is_video() || entry.is_pdf())
 }
 
 /// Accept file drops on a row. A folder row is the destination; dropping on a

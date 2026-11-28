@@ -1,0 +1,14 @@
+Package: delve
+Version: 1.0.1
+Section: utils
+Priority: optional
+Architecture: amd64
+Essential: no
+Installed-Size: 200
+Maintainer: Delve contributors <noreply@codebuff.com>
+Description: A fast, adaptable Linux file manager
+Delve is a distribution-neutral GTK4 file manager built for everyday file work.
+It combines five folder views, independent tabs, real file operations, archive
+support, tags, previews, and reusable command sets in one native Linux application.
+Homepage: https://github.com/io.github/delve/delve
+

@@ -26,6 +26,7 @@ mod thumbnails;
 mod transfers;
 mod util;
 mod views;
+mod volumes;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;

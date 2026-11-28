@@ -11,6 +11,9 @@ use std::rc::Rc;
 pub struct Sidebar {
     pub root: gtk::Widget,
     outer: gtk::Box,
+    /// Whether the rail is currently shown. This can differ from the saved
+    /// preference while a narrow window forces the compact layout.
+    mini: Cell<bool>,
     logo: gtk::Image,
     title: gtk::Label,
     toggle: gtk::Button,
@@ -59,7 +62,7 @@ impl Sidebar {
             let strong = Rc::downgrade(app);
             toggle.connect_clicked(move |_| {
                 if let Some(app) = strong.upgrade() {
-                    let mini = app.settings.borrow().sidebar_mini;
+                    let mini = app.sidebar_is_mini();
                     app.set_sidebar_mini(!mini);
                 }
             });
@@ -200,6 +203,7 @@ impl Sidebar {
         let sidebar = Sidebar {
             root: outer.clone().upcast(),
             outer,
+            mini: Cell::new(mini),
             logo,
             title,
             toggle,
@@ -223,8 +227,13 @@ impl Sidebar {
         self.tag_search.set_visible(visible);
     }
 
-    /// Switch between the icon-only rail and the full labelled sidebar.
-    pub fn set_mini(&self, app: &Rc<App>, mini: bool) {
+    /// Show the rail without touching the saved preference, so an automatic
+    /// narrow-window layout never overwrites what the user chose.
+    pub fn apply_mini(&self, app: &Rc<App>, mini: bool) {
+        if self.mini.get() == mini {
+            return;
+        }
+        self.mini.set(mini);
         if mini {
             self.outer.add_css_class("sidebar-mini");
         } else {
@@ -255,6 +264,14 @@ impl Sidebar {
             let s = app.settings.borrow();
             s.sidebar_collapsed.clone()
         };
+        // The tag list is the one persistent widget reused across syncs. Detach
+        // it from its previous section before that section is dropped; otherwise
+        // GTK refuses to re-parent an already-parented widget and the Tags
+        // section silently turns up empty.
+        if self.tags_box.parent().is_some() {
+            self.tags_box.unparent();
+        }
+
         // Clear.
         let mut child = self.content.first_child();
         while let Some(c) = child {
@@ -263,7 +280,7 @@ impl Sidebar {
             child = next;
         }
 
-        let mini = app.settings.borrow().sidebar_mini;
+        let mini = app.sidebar_is_mini();
         if let Some(tab) = app.active_tab() {
             let (field, ascending) = {
                 let state = tab.state.borrow();
@@ -334,6 +351,39 @@ impl Sidebar {
         add_place("folder-pictures", "Pictures", crate::paths::user_dir(UserDir::Pictures));
         add_place("folder-videos", "Videos", crate::paths::user_dir(UserDir::Videos));
         add_place("folder-music", "Music", crate::paths::user_dir(UserDir::Music));
+
+        // --- Pinned ---------------------------------------------------------
+        let pinned: Vec<std::path::PathBuf> = app
+            .settings
+            .borrow()
+            .pinned
+            .iter()
+            .filter(|p| p.is_dir())
+            .cloned()
+            .collect();
+        if !pinned.is_empty() {
+            let pinned_section = section(app, &self.content, "PINNED", "pinned", &sidebar_snapshot);
+            for path in pinned {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                let row = nav_row(app, "folder-symbolic", &label, Some(&path));
+                tint_nav_icon(app, &row, &path);
+                let loc = Location::Path(path.clone());
+                set_active(&row, &active == &loc);
+                install_place_drop(app, &row, Some(path.clone()));
+                row.connect_clicked({
+                    let strong = Rc::downgrade(app);
+                    move |_| {
+                        if let Some(app) = strong.upgrade() {
+                            app.navigate_active(Location::Path(path.clone()));
+                        }
+                    }
+                });
+                pinned_section.append(&row);
+            }
+        }
 
         // --- Tags -----------------------------------------------------------
         let tags_section = section(app, &self.content, "TAGS", "tags", &sidebar_snapshot);
@@ -460,24 +510,56 @@ impl Sidebar {
             }
         });
         system.append(&row);
-        for (label, path) in crate::paths::mounts() {
-            if path == crate::paths::root() {
-                continue;
-            }
-            let row = nav_row(app, "drive-removable-media-symbolic", &label, Some(&path));
-            let loc = Location::Path(path.clone());
-            set_active(&row, &active == &loc);
-            install_place_drop(app, &row, Some(path));
-            row.connect_clicked({
-                let strong = Rc::downgrade(app);
-                let loc = loc.clone();
-                move |_| {
-                    if let Some(app) = strong.upgrade() {
-                        app.navigate_active(loc.clone());
+        for volume in crate::volumes::snapshot() {
+            match volume.mount_point.clone() {
+                Some(path) => {
+                    if path == crate::paths::root() {
+                        continue;
                     }
+                    let row = nav_row(app, &volume.icon_name(), &volume.name, Some(&path));
+                    if let Some(space) = crate::paths::disk_space(&path) {
+                        row.set_tooltip_text(Some(&format!(
+                            "{}\n{} free of {}",
+                            path.display(),
+                            crate::fs::human_size(space.free),
+                            crate::fs::human_size(space.total)
+                        )));
+                    }
+                    let loc = Location::Path(path.clone());
+                    set_active(&row, &active == &loc);
+                    install_place_drop(app, &row, Some(path.clone()));
+                    row.connect_clicked({
+                        let strong = Rc::downgrade(app);
+                        let loc = loc.clone();
+                        move |_| {
+                            if let Some(app) = strong.upgrade() {
+                                app.navigate_active(loc.clone());
+                            }
+                        }
+                    });
+                    system.append(&row);
                 }
-            });
-            system.append(&row);
+                None => {
+                    // Unmounted partitions and pendrives are listed so they can
+                    // be mounted with one click instead of opening Disks.
+                    if !volume.can_mount {
+                        continue;
+                    }
+                    let row = nav_row(app, &volume.icon_name(), &volume.name, None);
+                    row.set_tooltip_text(Some(&format!("{} — click to mount", volume.name)));
+                    row.add_css_class("unmounted-volume");
+                    row.connect_clicked({
+                        let strong = Rc::downgrade(app);
+                        let volume = volume.clone();
+                        move |_| {
+                            if let Some(app) = strong.upgrade() {
+                                app.mount_volume(&volume);
+                            }
+                        }
+                    });
+                    system.append(&row);
+                }
+            }
         }
     }
 }
@@ -489,7 +571,7 @@ fn section(
     key: &str,
     collapsed: &[String],
 ) -> gtk::Box {
-    let mini = app.settings.borrow().sidebar_mini;
+    let mini = app.sidebar_is_mini();
     let expander = gtk::Expander::new(None);
     expander.add_css_class("sidebar-section");
     expander.set_expanded(mini || !collapsed.iter().any(|c| c == key));
@@ -520,23 +602,27 @@ fn section(
     body
 }
 
-/// In the narrow rail the place icons keep their meaning but use dedicated
-/// symbolic artwork instead of the shared folder glyph.
-fn mini_icon(icon: &str) -> &str {
+/// Place rows use symbolic artwork in both sidebar modes. Symbolic icons take
+/// the row's CSS colour, so they stay legible in light and dark themes; the
+/// full-colour variants ignore `color` and turned muddy on dark backgrounds.
+fn symbolic_place_icon(icon: &str) -> &str {
     match icon {
         "user-home" => "user-home-symbolic",
         "user-desktop" => "user-desktop-symbolic",
-        "folder-documents" => "x-office-document-symbolic",
+        "folder-documents" => "folder-documents-symbolic",
         "folder-download" => "folder-download-symbolic",
-        "folder-pictures" => "image-x-generic-symbolic",
-        "folder-videos" => "video-x-generic-symbolic",
-        "folder-music" => "audio-x-generic-symbolic",
+        "folder-pictures" => "folder-pictures-symbolic",
+        "folder-videos" => "folder-videos-symbolic",
+        "folder-music" => "folder-music-symbolic",
+        "folder-publicshare" => "folder-publicshare-symbolic",
+        "folder-templates" => "folder-templates-symbolic",
+        "folder-remote" => "folder-remote-symbolic",
         other => other,
     }
 }
 
-fn nav_row(app: &Rc<App>, icon: &str, label: &str, _path: Option<&std::path::Path>) -> gtk::Button {
-    let mini = app.settings.borrow().sidebar_mini;
+fn nav_row(app: &Rc<App>, icon: &str, label: &str, path: Option<&std::path::Path>) -> gtk::Button {
+    let mini = app.sidebar_is_mini();
     let row = gtk::Button::new();
     row.add_css_class("sidebar-row");
     row.set_has_frame(false);
@@ -544,7 +630,7 @@ fn nav_row(app: &Rc<App>, icon: &str, label: &str, _path: Option<&std::path::Pat
     let b = gtk::Box::new(gtk::Orientation::Horizontal, if mini { 0 } else { 8 });
     b.set_hexpand(!mini);
     b.set_halign(if mini { gtk::Align::Center } else { gtk::Align::Fill });
-    let img = gtk::Image::from_icon_name(if mini { mini_icon(icon) } else { icon });
+    let img = gtk::Image::from_icon_name(symbolic_place_icon(icon));
     img.set_pixel_size(if mini { 18 } else { 15 });
     b.append(&img);
     let text = gtk::Label::new(Some(label));
@@ -560,6 +646,22 @@ fn nav_row(app: &Rc<App>, icon: &str, label: &str, _path: Option<&std::path::Pat
     row.set_child(Some(&b));
     row.set_tooltip_text(Some(label));
     apply_nav_mini(&row, mini);
+    if let Some(path) = path {
+        // Right-click offers open/pin/copy/properties without cluttering the
+        // rail itself.
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        let strong = Rc::downgrade(app);
+        let target = path.to_path_buf();
+        let row_ref = row.clone();
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            if let Some(app) = strong.upgrade() {
+                app.show_path_context_menu(&row_ref, target.clone(), x, y);
+                let _ = gesture;
+            }
+        });
+        row.add_controller(gesture);
+    }
     row
 }
 
@@ -691,7 +793,7 @@ fn rebuild_tags(app: &Rc<App>, container: &gtk::Box, filter: &str) {
         _ => Vec::new(),
     };
     let tags = app.meta.borrow().tags.clone();
-    let mini = app.settings.borrow().sidebar_mini;
+    let mini = app.sidebar_is_mini();
     if tags.is_empty() {
         let hint = gtk::Label::new(Some("No tags yet"));
         hint.add_css_class("dim");
@@ -743,9 +845,12 @@ fn rebuild_tags(app: &Rc<App>, container: &gtk::Box, filter: &str) {
             let strong = Rc::downgrade(app);
             let id = tag.id.clone();
             row.connect_clicked(move |_| {
-                if let Some(app) = strong.upgrade() {
-                    app.activate_tag(&id);
-                }
+                // Opening a tag rebuilds this sidebar. Defer it until the click
+                // signal has finished, so the row that emitted it is not
+                // destroyed underneath GTK's signal emission.
+                let Some(app) = strong.upgrade() else { return };
+                let id = id.clone();
+                gtk4::glib::idle_add_local_once(move || app.activate_tag(&id));
             });
         }
         // Drop files onto a tag assigns it.
@@ -827,7 +932,13 @@ fn rebuild_tags(app: &Rc<App>, container: &gtk::Box, filter: &str) {
         row.add_controller(motion);
         {
             let popover = popover.clone();
-            row.connect_destroy(move |_| popover.popdown());
+            row.connect_destroy(move |_| {
+                popover.popdown();
+                // The popover is parented to the row; without unparenting it
+                // GTK finalises the row with children still attached, which
+                // leaves stale popovers behind every sidebar rebuild.
+                popover.unparent();
+            });
         }
         container.append(&row);
     }

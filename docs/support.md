@@ -174,7 +174,7 @@ current directory.
 - Some LocalSend peers use HTTPS with a self-signed certificate. Delve refuses
   to disable certificate verification; the transfer fails with an error instead.
 
-Receiving is not implemented in 1.0.0.
+Receiving is not implemented in 1.0.1.
 
 ### The application crashes
 
@@ -228,4 +228,4 @@ not own.
   export.
 - Compatibility with every terminal emulator, desktop shell, or icon theme.
 - Transfers with peers that require disabled TLS verification.
-- Decoding of video or PDF previews, which are not implemented in 1.0.0.
+- Decoding of video or PDF previews, which are not implemented in 1.0.1.

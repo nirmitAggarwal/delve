@@ -40,6 +40,17 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.1" date="2026-11-28">
+      <description>
+        <p>Patch release with responsive Icon view selection and distro packages.</p>
+        <ul>
+          <li>Right-clicking anywhere in the Icon view canvas opens the folder menu, including below the last row.</li>
+          <li>Clicks in the gaps between icons no longer select a neighbour.</li>
+          <li>Native Debian, Fedora, and Arch packages are available; each pulls in GTK 4.10+ and ships the complete bundled icon theme.</li>
+          <li>Removable media appears and disappears immediately, even when the app is unfocused.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-11-22">
       <description>
         <p>First stable release.</p>

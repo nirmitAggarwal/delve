@@ -76,7 +76,7 @@ cargo check
 cargo build --message-format short
 ```
 
-There is no automated test suite in 1.0.0. Do not claim a test suite exists.
+There is no automated test suite in 1.0.1. Do not claim a test suite exists.
 Manual runtime verification is part of the release checklist below.
 
 ## Release build
@@ -173,14 +173,14 @@ The script validates the metadata, builds with `--locked`, stages the release,
 and writes:
 
 ```text
-dist/delve-1.0.0-linux-x86_64.tar.gz
+dist/delve-1.0.1-linux-x86_64.tar.gz
 dist/SHA256SUMS
 ```
 
 The tarball contains:
 
 ```text
-delve-1.0.0-linux-x86_64/
+delve-1.0.1-linux-x86_64/
 ├── delve
 ├── install.sh
 ├── uninstall.sh
@@ -251,7 +251,7 @@ test -f assets/icons/Delve/index.theme
 test -f assets/icons/COPYING.ADWAITA
 ```
 
-Expected counts for 1.0.0 are 756 bundled-theme files and 9 application icon
+Expected counts for 1.0.1 are 756 bundled-theme files and 9 application icon
 files. If you intentionally change the theme, update these counts and the notes
 in `assets/icons/README.md`.
 
@@ -334,7 +334,7 @@ artifacts, or announce a release until the owner has reviewed the checklist.
 A typical release consists of:
 
 1. Commit the version, changelog, metadata, and any documentation changes.
-2. Tag the commit `v1.0.0` (annotated tag).
+2. Tag the commit `v1.0.1` (annotated tag).
 3. Build and validate from that exact commit.
 4. Upload the tarball and `SHA256SUMS` to the project's release page.
 5. Publish the changelog text with the release.

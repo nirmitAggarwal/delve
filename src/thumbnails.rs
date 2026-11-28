@@ -5,8 +5,10 @@
 //! runtime-detected backend; when unavailable, Delve falls back to a file icon.
 
 use crate::fs::Entry;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone, Debug)]
 pub enum Preview {
@@ -176,6 +178,110 @@ fn pdf_thumbnail(input: &Path, out: &Path, size: u32) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------
+// Background queue
+// ---------------------------------------------------------------------
+
+/// One pending preview request.
+struct ThumbJob {
+    entry: Entry,
+    size: u32,
+}
+
+struct QueueState {
+    /// Items the user can currently see. Always drained before `later`.
+    urgent: VecDeque<ThumbJob>,
+    /// Items further down the folder, generated only when nothing visible is
+    /// waiting.
+    later: VecDeque<ThumbJob>,
+    /// Paths already in the queue, so a repaint never duplicates work.
+    waiting: HashSet<PathBuf>,
+}
+
+/// A small pool of thumbnail workers sharing one two-level priority queue.
+///
+/// The previous implementation spawned one thread per folder sync, so a large
+/// folder could queue hundreds of decodes that all raced the visible items;
+/// nothing could be prioritised because every sync had its own thread.
+pub struct ThumbQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+/// Parallel decoders. Decoding a large photo dominates the cost, so a handful
+/// of workers fill the first screenful much sooner than one does.
+const WORKERS: usize = 3;
+
+impl ThumbQueue {
+    pub fn new() -> Arc<ThumbQueue> {
+        Arc::new(ThumbQueue {
+            state: Mutex::new(QueueState {
+                urgent: VecDeque::new(),
+                later: VecDeque::new(),
+                waiting: HashSet::new(),
+            }),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Enqueue a job. Returns false when the path is already waiting.
+    pub fn push(&self, entry: Entry, size: u32, urgent: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.waiting.insert(entry.path.clone()) {
+            return false;
+        }
+        let job = ThumbJob { entry, size };
+        if urgent {
+            state.urgent.push_back(job);
+        } else {
+            state.later.push_back(job);
+        }
+        drop(state);
+        self.ready.notify_one();
+        true
+    }
+
+    /// Clear a path's queued marker; call on the UI thread when it completes.
+    pub fn finish(&self, path: &Path) {
+        self.state.lock().unwrap().waiting.remove(path);
+    }
+
+    /// Start the worker threads. Rendering happens off the main thread; results
+    /// are published back through the dispatcher.
+    ///
+    /// A few workers keep a folder of large photos filling in quickly, while the
+    /// shared priority queue still hands out visible items first.
+    pub fn spawn_workers(self: &Arc<ThumbQueue>) {
+        for index in 0..WORKERS {
+            let queue = Arc::clone(self);
+            let _ = std::thread::Builder::new()
+                .name(format!("delve-thumbnails-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut state = queue.state.lock().unwrap();
+                        loop {
+                            if let Some(job) = state.urgent.pop_front() {
+                                break job;
+                            }
+                            if let Some(job) = state.later.pop_front() {
+                                break job;
+                            }
+                            state = queue.ready.wait(state).unwrap();
+                        }
+                    };
+                    let path = job.entry.path.clone();
+                    let thumb = thumbnail_for(&job.entry, job.size);
+                    crate::dispatch::post_simple(move |app| {
+                        app.thumb_queue.finish(&path);
+                        app.thumb_pending.borrow_mut().remove(&path);
+                        app.thumbs.borrow_mut().insert(path, thumb);
+                        app.schedule_thumb_refresh();
+                    });
+                });
+        }
+    }
 }
 
 pub fn which(program: &str) -> Option<PathBuf> {

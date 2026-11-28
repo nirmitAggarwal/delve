@@ -2,7 +2,6 @@
 
 use crate::app::{App, Tab};
 use crate::fs::{self, Entry, ScanConfig, SortField, SortSpec};
-use crate::paths::UserDir;
 use crate::model::{Location, SearchFilters};
 use crate::settings::ViewKind;
 use gtk4 as gtk;
@@ -320,44 +319,11 @@ impl App {
     }
 
     fn load_home(self: &Rc<Self>, tab_id: u64, generation: u64) {
-        let recent = self.settings.borrow().recent_locations.clone();
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut push = |p: PathBuf| {
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        };
-        for dir in [
-            UserDir::Desktop,
-            UserDir::Documents,
-            UserDir::Downloads,
-            UserDir::Pictures,
-            UserDir::Music,
-            UserDir::Videos,
-        ] {
-            push(crate::paths::user_dir(dir));
-        }
-        let home = crate::paths::home();
-        for path in recent {
-            // Home is already the sidebar entry; skip it, the filesystem root
-            // and any parent of home so quick access stays useful.
-            if path == home || home.starts_with(&path) {
-                continue;
-            }
-            push(path);
-        }
-        let entries: Vec<Entry> = dirs
-            .into_iter()
-            .map(|path| {
-                let name = if path == crate::paths::home() {
-                    "Home".to_string()
-                } else {
-                    fs::file_name_of(&path)
-                };
-                Entry::from_path(path, name)
-            })
-            .collect();
-        self.apply_entries(tab_id, generation, entries, None);
+        // Home is the overview dashboard, not the `~` folder listing. The
+        // dashboard builds its own rows; `~` stays reachable as a real path
+        // (sidebar Home is the dashboard, the dashboard's Open folder button
+        // and `~` breadcrumbs open the actual directory).
+        self.apply_entries(tab_id, generation, Vec::new(), None);
     }
 
     fn load_path(self: &Rc<Self>, tab_id: u64, path: PathBuf, generation: u64) {
@@ -788,7 +754,15 @@ impl App {
 
     pub fn sync_views(self: &Rc<Self>, tab_id: u64) {
         let Some(tab) = self.tab_by_id(tab_id) else { return };
-        let view = tab.state.borrow().view;
+        let (view, is_home) = {
+            let state = tab.state.borrow();
+            (state.view, matches!(state.location, Location::Home))
+        };
+        if is_home {
+            tab.views.home.sync(self, tab_id);
+            tab.views.show_home();
+            return;
+        }
         tab.views.show(view);
         match view {
             ViewKind::Icon => tab.views.icon.sync(self, tab_id),
@@ -858,6 +832,46 @@ impl App {
         self.refresh_sidebar();
     }
 
+    /// Jump to the first visible entry whose name starts with the typed
+    /// prefix. The prefix resets after a short pause, so typing "do" then
+    /// waiting then "w" starts a fresh search.
+    pub fn quick_select(self: &Rc<Self>, ch: char) {
+        let Some(tab) = self.active_tab() else { return };
+        if matches!(tab.state.borrow().location, Location::Home) {
+            return;
+        }
+        let needle = {
+            let mut prefix = self.quick_prefix.borrow_mut();
+            if prefix.1.elapsed() > std::time::Duration::from_millis(900) {
+                prefix.0.clear();
+            }
+            prefix.0.push(ch.to_ascii_lowercase());
+            prefix.1 = std::time::Instant::now();
+            prefix.0.clone()
+        };
+        let target = {
+            let state = tab.state.borrow();
+            let entries = state.visible_entries();
+            entries
+                .iter()
+                .find(|e| e.name.to_lowercase().starts_with(&needle))
+                .map(|e| e.path.clone())
+        };
+        let Some(path) = target else {
+            // A longer prefix with no match falls back to the last character,
+            // which is how repeated presses cycle through prefixes.
+            if needle.chars().count() > 1 {
+                self.quick_prefix.borrow_mut().0.clear();
+                if let Some(ch) = needle.chars().last() {
+                    self.quick_select(ch);
+                }
+            }
+            return;
+        };
+        self.set_selection(tab.id, vec![path.clone()], Some(path.clone()));
+        tab.views.reveal(&path);
+    }
+
     pub fn toggle_hidden(self: &Rc<Self>) {
         let Some(tab) = self.active_tab() else { return };
         {
@@ -879,41 +893,6 @@ impl App {
             if anchor.is_some() {
                 state.anchor = anchor;
             }
-        }
-        self.after_selection_change(tab_id);
-    }
-
-    pub fn toggle_selection(self: &Rc<Self>, tab_id: u64, path: &std::path::Path) {
-        let Some(tab) = self.tab_by_id(tab_id) else { return };
-        {
-            let mut state = tab.state.borrow_mut();
-            if state.selection.contains(path) {
-                state.selection.remove(path);
-            } else {
-                state.selection.insert(path.to_path_buf());
-                state.anchor = Some(path.to_path_buf());
-            }
-        }
-        self.after_selection_change(tab_id);
-    }
-
-    pub fn extend_selection_to(self: &Rc<Self>, tab_id: u64, path: &std::path::Path) {
-        let Some(tab) = self.tab_by_id(tab_id) else { return };
-        let visible: Vec<PathBuf> = tab.state.borrow().visible_entries().iter().map(|e| e.path.clone()).collect();
-        let anchor = tab.state.borrow().anchor.clone().unwrap_or_else(|| path.to_path_buf());
-        let (Some(a), Some(b)) = (
-            visible.iter().position(|p| p == &anchor),
-            visible.iter().position(|p| p == path),
-        ) else {
-            self.set_selection(tab_id, vec![path.to_path_buf()], Some(path.to_path_buf()));
-            return;
-        };
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let paths = visible[lo..=hi].to_vec();
-        {
-            let mut state = tab.state.borrow_mut();
-            state.selection = paths.into_iter().collect();
-            state.anchor = Some(anchor);
         }
         self.after_selection_change(tab_id);
     }
@@ -1241,6 +1220,9 @@ impl App {
             self.sync_views(tab.id);
             self.ui().inspector_widget.update(self, tab.id);
         }
+        // Breadcrumbs carry a folder-colour dot, so they must be rebuilt too;
+        // otherwise a reset colour keeps its old swatch on screen.
+        self.update_toolbar();
         self.refresh_sidebar();
         self.update_status();
     }

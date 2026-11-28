@@ -235,6 +235,33 @@ impl GraphView {
             }
         };
 
+        // Right-click: item menu on a node, workspace menu on empty canvas.
+        {
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(3);
+            let hit = hit_test.clone();
+            let nodes = nodes.clone();
+            let strong = Rc::downgrade(app);
+            let view = drawing.clone();
+            gesture.connect_pressed(move |_, _, x, y| {
+                let Some(app) = strong.upgrade() else { return };
+                let anchor: gtk::Widget = view.clone().upcast();
+                let idx = hit(x, y, view.width() as f64, view.height() as f64);
+                match idx.and_then(|i| nodes.borrow().get(i).cloned()) {
+                    Some(node) => {
+                        app.set_selection(tab_id, vec![node.path.clone()], Some(node.path.clone()));
+                        app.show_context_menu(tab_id, &anchor, Some(node.path.clone()), x, y);
+                    }
+                    None => {
+                        app.set_selection(tab_id, Vec::new(), None);
+                        app.show_context_menu(tab_id, &anchor, None, x, y);
+                    }
+                }
+                view.queue_draw();
+            });
+            drawing.add_controller(gesture);
+        }
+
         // Click selects; a folder expands or collapses on a single click, and a
         // double click opens it.
         {

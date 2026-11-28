@@ -284,6 +284,35 @@ impl TreemapView {
                     .cloned()
             }
         };
+        // Right-click: item menu on a tile, workspace menu on empty canvas.
+        {
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(3);
+            let hit = hit.clone();
+            let strong = Rc::downgrade(app);
+            let view = drawing.clone();
+            let selected_node_right = selected_node.clone();
+            let scan_used_right = scan_used.clone();
+            gesture.connect_pressed(move |_, _, x, y| {
+                let Some(app) = strong.upgrade() else { return };
+                let anchor: gtk::Widget = view.clone().upcast();
+                match hit(x, y)
+                    .and_then(|tr| scan_path_for_rect(&scan_used_right, &tr).map(|p| (tr, p)))
+                {
+                    Some((tr, path)) => {
+                        selected_node_right.set(Some(tr.node));
+                        app.set_selection(tab_id, vec![path.clone()], Some(path.clone()));
+                        app.show_context_menu(tab_id, &anchor, Some(path), x, y);
+                    }
+                    None => {
+                        selected_node_right.set(None);
+                        app.set_selection(tab_id, Vec::new(), None);
+                        app.show_context_menu(tab_id, &anchor, None, x, y);
+                    }
+                }
+            });
+            drawing.add_controller(gesture);
+        }
         {
             let gesture = gtk::GestureClick::new();
             gesture.set_button(1);

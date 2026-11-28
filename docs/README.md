@@ -1,7 +1,7 @@
 # Delve documentation
 
 Delve is a GTK4 file manager for Linux written in Rust. This directory contains
-the complete documentation set for version 1.0.0.
+the complete documentation set for version 1.0.1.
 
 | Guide | What it covers |
 | --- | --- |
